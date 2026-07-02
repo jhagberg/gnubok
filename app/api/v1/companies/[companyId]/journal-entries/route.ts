@@ -21,7 +21,7 @@ import {
   encodeDefaultCursor,
   parsePaginationParams,
 } from '@/lib/api/v1/pagination'
-import { registerEndpoint } from '@/lib/api/v1/registry'
+import { registerEndpoint, listEnvelope, dataEnvelope } from '@/lib/api/v1/registry'
 import { withApiV1 } from '@/lib/api/v1/with-api-v1'
 import { v1ErrorResponse, v1ErrorResponseFromCode } from '@/lib/api/v1/errors'
 import { checkPeriodLock } from '@/lib/api/v1/check-period-lock'
@@ -49,7 +49,7 @@ const JournalEntrySummary = z.object({
   created_at: z.string(),
 })
 
-const JournalEntriesListResponse = z.object({ journal_entries: z.array(JournalEntrySummary) })
+const JournalEntriesListResponse = listEnvelope(JournalEntrySummary)
 
 const JournalEntryLine = z.object({
   id: z.string().uuid(),
@@ -246,7 +246,7 @@ registerEndpoint({
   reversible: true,
   dryRunSupported: true,
   request: { body: CreateJournalEntrySchema },
-  response: { success: JournalEntryDetail },
+  response: { success: dataEnvelope(JournalEntryDetail) },
 })
 
 export const POST = withApiV1<{ params: Promise<{ companyId: string }> }>(

@@ -11,7 +11,6 @@ import {
 } from '@/components/ui/dialog'
 import { Button } from '@/components/ui/button'
 import { Input } from '@/components/ui/input'
-import { Badge } from '@/components/ui/badge'
 import AccountCombobox from '@/components/bookkeeping/AccountCombobox'
 import CorrectionPreview from '@/components/bookkeeping/CorrectionPreview'
 import { useToast } from '@/components/ui/use-toast'
@@ -166,9 +165,9 @@ export default function CorrectionEntryDialog({ entry, open, onOpenChange, onCor
         {/* Original entry metadata — lines live inside CorrectionPreview below */}
         <div className="space-y-1">
           <div className="flex items-center gap-2 text-sm text-muted-foreground flex-wrap">
+            <span className="text-muted-foreground">Original</span>
             <span className="font-mono">{formatVoucher(entry)}</span>
             <span className="tabular-nums">{formatDate(entry.entry_date)}</span>
-            <Badge variant="outline" className="text-xs">Original</Badge>
           </div>
           <p className="text-sm">{entry.description}</p>
         </div>
@@ -178,7 +177,14 @@ export default function CorrectionEntryDialog({ entry, open, onOpenChange, onCor
 
         {/* Corrected lines (editable) */}
         <div className="space-y-2">
-          <p className="text-sm font-medium">Rättade rader</p>
+          <div className="space-y-1">
+            <p className="text-sm font-medium">Rättade rader</p>
+            <p className="text-xs text-muted-foreground">
+              Det här är hela den nya verifikationen — alla konton som ska finnas kvar måste stå
+              kvar. Tar du bort ett konto nollställs det (stornon återför det). Vill du bara återföra
+              hela verifikatet utan att ersätta det, använd Återför (storno) istället.
+            </p>
+          </div>
 
           <div className="space-y-2">
             {lines.map((line, index) => (

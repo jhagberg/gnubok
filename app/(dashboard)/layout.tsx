@@ -13,6 +13,7 @@ import { SandboxBanner } from '@/components/dashboard/SandboxBanner'
 import { getExtensionNavItems } from '@/lib/extensions/sectors'
 import { CompanyProvider } from '@/contexts/CompanyContext'
 import { getActiveCompanyId } from '@/lib/company/context'
+import { getCompanyCapabilities } from '@/lib/entitlements/has-capability'
 import { getBranding } from '@/lib/branding/service'
 import { ensureSandboxAgentProfile } from '@/lib/sandbox/ensure-agent'
 import { countPendingOperations, countUnbookedTransactions } from '@/lib/worklist'
@@ -93,6 +94,7 @@ export default async function DashboardLayout({
           isTeamMember,
           team,
           isSandbox: false,
+          capabilities: [],
         }}
       >
         <AgentSheetProvider>
@@ -147,6 +149,7 @@ export default async function DashboardLayout({
       isTeamMember,
       team,
       isSandbox: false,
+      capabilities: [],
     }
 
     return (
@@ -181,10 +184,11 @@ export default async function DashboardLayout({
     pendingOpsCount,
     { data: agentProfileIdentity },
     { data: userProfile },
+    capabilities,
   ] = await Promise.all([
     supabase
       .from('company_settings')
-      .select('company_name, onboarding_complete, entity_type, is_sandbox')
+      .select('company_name, onboarding_complete, entity_type, pays_salaries, is_sandbox')
       .eq('company_id', companyId)
       .single(),
     // Shared worklist predicates (lib/worklist) — the badge must show the
@@ -203,6 +207,7 @@ export default async function DashboardLayout({
     // popover (full_name + initial) so it's clear which user is logged
     // in, distinct from the active company shown at the top.
     supabase.from('profiles').select('full_name').eq('id', user.id).maybeSingle(),
+    getCompanyCapabilities(supabase, companyId),
   ])
 
   // If onboarding incomplete, still render the dashboard — the page component
@@ -210,9 +215,23 @@ export default async function DashboardLayout({
 
   // Use company_name from settings as the display name (companies.name may be stale)
   const displayName = settings?.company_name || companyRow.name
-  const companyWithName = { ...companyRow, name: displayName }
 
-  const entityType = (settings?.entity_type as EntityType) || 'enskild_firma'
+  // Resolve entity type the same way the report engines and
+  // getCompanyEntityType do: company_settings is read-primary, companies is the
+  // canonical fallback, then default to enskild_firma. Mirroring it onto the
+  // active company keeps the settings rail (useSettingsNavItems, which reads
+  // context) and the sidebar in agreement on who is an employer. #782
+  const entityType =
+    (settings?.entity_type as EntityType) ||
+    (companyRow.entity_type as EntityType) ||
+    'enskild_firma'
+  const paysSalaries = settings?.pays_salaries ?? false
+  const companyWithName = {
+    ...companyRow,
+    name: displayName,
+    entity_type: entityType,
+    pays_salaries: paysSalaries,
+  }
 
   const isSandbox = settings?.is_sandbox === true
 
@@ -247,6 +266,7 @@ export default async function DashboardLayout({
     isTeamMember,
     team,
     isSandbox,
+    capabilities,
   }
 
   return (
@@ -271,6 +291,7 @@ export default async function DashboardLayout({
           <DashboardNav
             companyName={settings?.company_name || 'Min verksamhet'}
             entityType={entityType}
+            paysSalaries={paysSalaries}
             uncategorizedTransactionCount={uncategorizedCount}
             pendingOperationsCount={pendingOpsCount}
             isSandbox={isSandbox}

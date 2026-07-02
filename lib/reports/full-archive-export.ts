@@ -209,6 +209,8 @@ export async function estimateArchiveSize(
         .eq('company_id', companyId)
         .eq('fiscal_period_id', periodId)
         .in('status', ['posted', 'reversed'])
+        // Stable total order for correct paging (see fetch-all.ts).
+        .order('id', { ascending: true })
         .range(from, to)
     )
     const ids = periodEntryIds.map((e) => e.id)
@@ -345,6 +347,8 @@ async function writeDocuments(
         )
         .eq('company_id', companyId)
         .not('journal_entry_id', 'is', null)
+        // Stable total order for correct paging (see fetch-all.ts).
+        .order('id', { ascending: true })
         .range(from, to)
     )
 
@@ -682,13 +686,18 @@ async function writeMasterData(
   await Promise.all(
     tables.map(async (t) => {
       try {
-        const rows = await fetchAllRows<Record<string, unknown>>(({ from, to }) => {
+        const rows = await fetchAllRows<{ id: string } & Record<string, unknown>>(({ from, to }) => {
           let q = supabase.from(t.name).select('*').eq('company_id', companyId)
           if (t.orderBy) {
             q = q.order(t.orderBy, { ascending: true })
           }
-          return q.range(from, to)
-        })
+          // Always end on the unique PK so paging has a stable TOTAL order. A
+          // non-unique display order (e.g. created_at) or no order at all
+          // silently SKIPS/DUPLICATES rows across page boundaries — data loss in
+          // a statutory 7-year retention archive. (All these tables have an
+          // `id uuid` PK.) dedupeBy is defense-in-depth against the duplicate case.
+          return q.order('id', { ascending: true }).range(from, to)
+        }, { dedupeBy: (r) => r.id })
         data.file(t.file, JSON.stringify(rows, null, 2))
       } catch (err) {
         data.file(
@@ -729,6 +738,9 @@ async function buildEntryToPeriodMap(
   } else {
     query = query.in('fiscal_period_id', periodIds)
   }
+
+  // Stable total order for correct paging (see fetch-all.ts).
+  query = query.order('id', { ascending: true })
 
   const entries = await fetchAllRows<{ id: string; fiscal_period_id: string }>(({ from, to }) =>
     query.range(from, to)

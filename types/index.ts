@@ -35,6 +35,11 @@ export interface Company {
   archived_at: string | null
   created_at: string
   updated_at: string
+  // Denormalised from company_settings onto the active company in the
+  // dashboard layout so context consumers (e.g. the settings rail) can tell
+  // whether the company is a registered employer without an extra fetch.
+  // Optional because it isn't a column on `companies`. #782
+  pays_salaries?: boolean
 }
 
 // Company membership
@@ -327,6 +332,10 @@ export interface BankConnection {
 
   // Status
   status: BankConnectionStatus
+
+  // PSD2 PSU type chosen at authorization. Reused on reconnect so consent
+  // renewals keep the account type that actually worked. NULL on legacy rows.
+  psu_type: 'personal' | 'business' | null
 
   // Consent
   consent_expires: string | null
@@ -1671,6 +1680,8 @@ export interface SIEExportOptions {
    * our closing entry would zero out the P&L accounts.
    */
   exclude_year_end_closing?: boolean
+  /** Emit #FORMAT PC8 in the header. Set true when the caller will encode the output as CP437. */
+  emit_format_pc8?: boolean
 }
 
 // Input types for creating entries
@@ -1735,6 +1746,9 @@ export type PendingOperationType =
   | 'uncategorize_transaction'
   // Document inbox: pin doc to bank transaction
   | 'attach_document_to_transaction'
+  // Link a document directly to a journal entry (verifikation) — for imported/
+  // manual vouchers that have no bank-transaction row.
+  | 'link_document_to_voucher'
   // Manual transaction ingestion (uncategorized row, reversible by delete)
   | 'create_transaction'
   // Stream 1 Phase 1: supplier invoice lifecycle
@@ -1764,6 +1778,9 @@ export type PendingOperationType =
   | 'match_batch_allocate'
   // PR #606/#610: bulk-book N bank txs into 1 combined verifikat
   | 'bulk_book_transactions'
+  // Bulk-book N selected Underlag (Dokumentinkorgen) against their matched bank
+  // transactions — one verifikat per item, sharing a category + VAT treatment
+  | 'bulk_book_inbox_items'
   // PR #614: link a single bank tx to an already-posted verifikat (no new JE)
   | 'link_transaction_journal_entry'
   // PR5: Skatteverket filing via MCP. Commit = "send for BankID signing"

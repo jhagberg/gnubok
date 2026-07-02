@@ -180,6 +180,11 @@ const BOOKKEEPING: Record<string, StructuredErrorEntry> = {
     message_sv: 'Endast bokförda verifikationer kan stornas.',
     message_en: 'Only posted entries can be reversed.',
   },
+  CANNOT_REVERSE_STORNO: {
+    httpStatus: 400,
+    message_sv: 'En stornering eller rättelse kan inte stornas.',
+    message_en: 'A storno or correction entry cannot be reversed.',
+  },
   CANNOT_CORRECT_NON_POSTED: {
     httpStatus: 400,
     message_sv: 'Endast bokförda verifikationer kan rättas.',
@@ -910,6 +915,16 @@ const PERIOD: Record<string, StructuredErrorEntry> = {
     message_sv: 'Perioden är redan låst.',
     message_en: 'Period is already locked.',
   },
+  PERIOD_UNLOCK_NOT_LOCKED: {
+    httpStatus: 409,
+    message_sv: 'Perioden är inte låst.',
+    message_en: 'Period is not locked.',
+  },
+  PERIOD_UNLOCK_CLOSED: {
+    httpStatus: 409,
+    message_sv: 'Ett stängt räkenskapsår kan inte låsas upp.',
+    message_en: 'A closed fiscal year cannot be unlocked.',
+  },
   // Forward-chaining a new räkenskapsår is blocked while a prior period is
   // still fully open (not locked, not closed, not covered by the company-wide
   // lock-through date). BFL 6 kap allows löpande bokföring of the new year in
@@ -1267,6 +1282,23 @@ const OPENING_BALANCE_IMPORT: Record<string, StructuredErrorEntry> = {
     message_sv: 'Importen misslyckades.',
     message_en: 'Opening balance import failed.',
   },
+  OB_CORRECT_NO_EXISTING: {
+    httpStatus: 409,
+    message_sv: 'Perioden har inga ingående balanser att korrigera. Bokför dem först.',
+    message_en: 'The period has no opening balances to correct. Book them first.',
+  },
+  OB_CORRECT_YEAR_END_EXISTS: {
+    httpStatus: 409,
+    message_sv:
+      'Perioden har ett bokslut. Återför bokslutet och öppna perioden innan ingående balanser kan korrigeras.',
+    message_en:
+      'The period has a year-end close. Reverse the close and reopen the period before opening balances can be corrected.',
+  },
+  OB_CORRECT_FAILED: {
+    httpStatus: 500,
+    message_sv: 'Korrigeringen av ingående balanser misslyckades.',
+    message_en: 'Opening balance correction failed.',
+  },
 }
 
 const REGISTER_IMPORT: Record<string, StructuredErrorEntry> = {
@@ -1394,6 +1426,11 @@ const PROVIDER_MIGRATION: Record<string, StructuredErrorEntry> = {
     httpStatus: 500,
     message_sv: 'Migrationen från leverantören misslyckades.',
     message_en: 'Provider migration failed.',
+  },
+  PROVIDER_IMPORT_DOCUMENTS_FAILED: {
+    httpStatus: 500,
+    message_sv: 'Kunde inte importera underlag från leverantören.',
+    message_en: 'Failed to import documents from provider.',
   },
   PROVIDER_DISCONNECT_FAILED: {
     httpStatus: 500,

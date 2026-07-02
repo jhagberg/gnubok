@@ -6,6 +6,8 @@ import { Check, X, Loader2, AlertTriangle, Lock, ShieldCheck, ArrowRight } from 
 import { Button } from '@/components/ui/button'
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from '@/components/ui/select'
 import { Textarea } from '@/components/ui/textarea'
+import { useCapability } from '@/contexts/CompanyContext'
+import { CAPABILITY } from '@/lib/entitlements/keys'
 import type { PendingOperationRejectionCategory } from '@/types'
 import { cn } from '@/lib/utils'
 import { formatCurrency } from '@/lib/utils'
@@ -70,6 +72,12 @@ interface CommitResultData {
   invoice_id?: string | null
   customer_id?: string | null
   supplier_invoice_id?: string | null
+  // bulk_book_inbox_items creates N verifikationer, not one artifact — the
+  // executor returns per-item counts instead of a single id. Surfaced as a
+  // "N bokförda" summary + a link to the ledger (or the sole verifikat).
+  booked_count?: number
+  skipped_count?: number
+  booked?: Array<{ journal_entry_id?: string | null }>
 }
 
 export default function ApprovalCard({
@@ -81,6 +89,11 @@ export default function ApprovalCard({
   periodStatus,
   onRequestCorrection,
 }: Props) {
+  // Gating the AI re-propose path only: approving/rejecting the staged
+  // operation is manual ledger work and stays enabled without the AI add-on.
+  // What's paid is feeding a rejection back so the agent generates a *new*
+  // proposal (an LLM call) — that's suppressed when the company lacks `ai`.
+  const hasAi = useCapability(CAPABILITY.ai)
   const [state, setState] = useState<State>('pending')
   const [errorMessage, setErrorMessage] = useState<string | null>(null)
   const [confirmText, setConfirmText] = useState('')
@@ -190,7 +203,7 @@ export default function ApprovalCard({
       // Feed the correction back so the agent re-proposes — only when the user
       // actually said what was wrong. A bare reject just stops here.
       const parts = [categoryLabel, reason].filter(Boolean) as string[]
-      if (parts.length > 0) {
+      if (hasAi && parts.length > 0) {
         onRequestCorrection?.(
           `Jag avvisade förslaget. Det som var fel: ${parts.join(' — ')}. Föreslå en korrigerad bokning.`,
         )
@@ -227,6 +240,22 @@ export default function ApprovalCard({
         label: 'Öppna kund',
       }
     }
+    // Bulk operations (bulk_book_inbox_items) book N underlag at once and return
+    // counts instead of a single id. Show the outcome ("N bokförda · M
+    // överhoppade") — a bulk commit silently skips non-bookable items, so
+    // without this the user can't tell whether anything was booked — and link to
+    // the ledger list, or straight to the sole verifikat when exactly one landed.
+    const bulkSummary =
+      typeof commitResult?.booked_count === 'number'
+        ? { booked: commitResult.booked_count, skipped: commitResult.skipped_count ?? 0 }
+        : null
+    if (bulkSummary && !deepLink) {
+      const soleEntryId =
+        bulkSummary.booked === 1 ? commitResult?.booked?.[0]?.journal_entry_id : null
+      deepLink = soleEntryId
+        ? { href: `/bookkeeping/${soleEntryId}`, label: 'Öppna verifikation' }
+        : { href: '/bookkeeping', label: 'Öppna bokföringen' }
+    }
     // The server's `message` field (e.g. "Operation staged for review …
     // Open the Accounted web app to approve or reject it.") was written for
     // MCP clients without an inline approval surface. Inside the in-app
@@ -241,6 +270,12 @@ export default function ApprovalCard({
         <p className="flex items-center gap-2 font-medium">
           <Check className="h-4 w-4" /> Godkänt
         </p>
+        {bulkSummary && (
+          <p className="mt-1 text-xs text-muted-foreground tabular-nums">
+            {bulkSummary.booked} {bulkSummary.booked === 1 ? 'underlag bokfört' : 'underlag bokförda'}
+            {bulkSummary.skipped > 0 ? ` · ${bulkSummary.skipped} överhoppade` : ''}
+          </p>
+        )}
         {deepLink && (
           <Link
             href={deepLink.href}
@@ -345,9 +380,20 @@ export default function ApprovalCard({
             className="text-xs"
             aria-label="Notering"
           />
-          <p className="text-[11px] text-muted-foreground">
-            Med en anledning eller notering föreslår assistenten en korrigerad bokning direkt.
-          </p>
+          {hasAi ? (
+            <p className="text-[11px] text-muted-foreground">
+              Med en anledning eller notering föreslår assistenten en korrigerad bokning direkt.
+            </p>
+          ) : (
+            <p className="text-[11px] text-muted-foreground">
+              Din anledning sparas på förslaget. Vill du att assistenten automatiskt
+              föreslår en korrigerad bokning?{' '}
+              <Link href="/settings/billing" className="font-medium text-foreground hover:underline">
+                Uppgradera
+              </Link>
+              .
+            </p>
+          )}
           <div className="flex gap-2">
             <Button
               variant="destructive"

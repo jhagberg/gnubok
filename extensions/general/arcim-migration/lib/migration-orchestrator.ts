@@ -22,6 +22,7 @@ import type { MigrationProgress, MigrationResults, SkipReasons } from '../types'
 import type { ProviderName } from '@/lib/providers/types'
 import type { CustomerDto, SupplierDto, SalesInvoiceDto, SupplierInvoiceDto, PartyDto } from '@/lib/providers/dto'
 import { resolveConsent } from '@/lib/providers/resolve-consent'
+import { normalizeVatNumber, isValidSwedishVatNumber } from '@/lib/vat/vat-number'
 import {
   fetchCompanyInfoDirect,
   fetchCustomersDirect,
@@ -109,8 +110,22 @@ export async function executeMigration(options: MigrationOptions): Promise<Migra
           if (!existing?.company_name && mapped.company_name) updates.company_name = mapped.company_name
           if (!existing?.org_number && mapped.org_number) updates.org_number = mapped.org_number
           if (!existing?.vat_number && mapped.vat_number) {
-            updates.vat_number = mapped.vat_number
-            updates.vat_registered = true
+            // Normalise provider input; only persist a structurally valid
+            // SE+12 momsregistreringsnummer so a malformed value from an
+            // external API can't enter company_settings unchecked.
+            const normalizedVat = normalizeVatNumber(mapped.vat_number)
+            if (isValidSwedishVatNumber(normalizedVat)) {
+              updates.vat_number = normalizedVat
+              updates.vat_registered = true
+            } else {
+              // Observability: a provider sent a VAT number we can't normalise
+              // to a valid SE+12 momsregistreringsnummer. We drop it (above),
+              // but surface the anomaly so consistently-bad provider data is
+              // visible. Don't log the raw value — it can embed a personnummer.
+              console.warn(
+                `[migration] Dropped malformed VAT number from ${provider} for company ${companyId} (normalized length ${normalizedVat.length})`,
+              )
+            }
           }
           if (mapped.fiscal_year_start_month !== 1) {
             updates.fiscal_year_start_month = mapped.fiscal_year_start_month
@@ -176,9 +191,18 @@ export async function executeMigration(options: MigrationOptions): Promise<Migra
             continue
           }
 
+          // Dedup against already-imported records: prefer org-number, but fall
+          // back to name when the party has no org-number. Otherwise org-less
+          // customers (private persons) are re-created on every re-sync, since
+          // the org-number map can never match them.
           const orgNumber = getOrgNumberFromParty(customer.party)
-          if (orgNumber && orgNumberToCustomerId.has(orgNumber)) {
-            customerIdMap.set(customer.id, orgNumberToCustomerId.get(orgNumber)!)
+          const existingCustomerId = orgNumber
+            ? orgNumberToCustomerId.get(orgNumber)
+            : customer.party.name
+              ? nameToCustomerId.get(customer.party.name)
+              : undefined
+          if (existingCustomerId) {
+            customerIdMap.set(customer.id, existingCustomerId)
             skipReasons.duplicate = (skipReasons.duplicate ?? 0) + 1
             skipped++
             continue
@@ -257,9 +281,16 @@ export async function executeMigration(options: MigrationOptions): Promise<Migra
             continue
           }
 
+          // Same org-number-then-name dedup as customers, so org-less suppliers
+          // (e.g. PostNord, IKANO BANK) aren't duplicated on every re-sync.
           const orgNumber = getOrgNumberFromParty(supplier.party)
-          if (orgNumber && orgNumberToSupplierId.has(orgNumber)) {
-            supplierIdMap.set(supplier.id, orgNumberToSupplierId.get(orgNumber)!)
+          const existingSupplierId = orgNumber
+            ? orgNumberToSupplierId.get(orgNumber)
+            : supplier.party.name
+              ? nameToSupplierId.get(supplier.party.name)
+              : undefined
+          if (existingSupplierId) {
+            supplierIdMap.set(supplier.id, existingSupplierId)
             skipReasons.duplicate = (skipReasons.duplicate ?? 0) + 1
             skipped++
             continue

@@ -39,7 +39,7 @@ import { z } from 'zod'
 import { renderToBuffer } from '@react-pdf/renderer'
 import { ok } from '@/lib/api/v1/response'
 import { dryRunPreview } from '@/lib/api/v1/dry-run'
-import { registerEndpoint } from '@/lib/api/v1/registry'
+import { registerEndpoint, dataEnvelope } from '@/lib/api/v1/registry'
 import { withApiV1 } from '@/lib/api/v1/with-api-v1'
 import { v1ErrorResponse, v1ErrorResponseFromCode } from '@/lib/api/v1/errors'
 import { InvoicePDF } from '@/lib/invoices/pdf-template'
@@ -55,6 +55,8 @@ import { uploadDocument } from '@/lib/core/documents/document-service'
 import { ensureInvoiceNumber } from '@/lib/invoices/ensure-invoice-number'
 import { eventBus } from '@/lib/events'
 import { guardSandbox } from '@/lib/sandbox/guard'
+import { requireCapability } from '@/lib/entitlements/has-capability'
+import { CAPABILITY } from '@/lib/entitlements/keys'
 import type { CompanySettings, Customer, EntityType, Invoice, InvoiceItem } from '@/types'
 
 const INVOICE_SEND_RESPONSE_COLUMNS =
@@ -113,7 +115,7 @@ registerEndpoint({
   idempotent: true,
   reversible: false,
   dryRunSupported: true,
-  response: { success: InvoiceSendResponse },
+  response: { success: dataEnvelope(InvoiceSendResponse) },
 })
 
 export const POST = withApiV1<{ params: Promise<{ companyId: string; id: string }> }>(
@@ -141,6 +143,9 @@ export const POST = withApiV1<{ params: Promise<{ companyId: string; id: string 
     // before any number is allocated or PDF is rendered.
     const blocked = await guardSandbox(ctx.supabase, ctx.companyId!)
     if (blocked) return blocked
+
+    const capBlocked = await requireCapability(ctx.supabase, ctx.companyId!, CAPABILITY.email_send)
+    if (capBlocked) return capBlocked
 
     // Step 1: email service configured?
     const emailService = getEmailService()

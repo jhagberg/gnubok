@@ -8,12 +8,13 @@ import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card'
 import { Button } from '@/components/ui/button'
 import { AccountNumber } from '@/components/ui/account-number'
 import { Textarea } from '@/components/ui/textarea'
-import { Loader2, ArrowLeft, Paperclip, AlertTriangle, Lock, MessageSquare, Pencil, Check, X, Copy, ChevronDown, CalendarClock, FileText, Link2 } from 'lucide-react'
+import { Loader2, ArrowLeft, Paperclip, AlertTriangle, Lock, MessageSquare, Pencil, Check, X, Copy, ChevronDown, CalendarClock, FileText, Link2, RotateCcw } from 'lucide-react'
 import {
   DropdownMenu,
   DropdownMenuTrigger,
   DropdownMenuContent,
   DropdownMenuItem,
+  DropdownMenuSeparator,
 } from '@/components/ui/dropdown-menu'
 import { useCanWrite } from '@/lib/hooks/use-can-write'
 import { formatDate } from '@/lib/utils'
@@ -21,8 +22,10 @@ import { formatVoucher } from '@/lib/bookkeeping/voucher-series-resolver'
 import JournalEntryAttachments from '@/components/bookkeeping/JournalEntryAttachments'
 import JournalEntryStatusBadge, { useSourceTypeLabels } from '@/components/bookkeeping/JournalEntryStatusBadge'
 import CorrectionEntryDialog from '@/components/bookkeeping/CorrectionEntryDialog'
+import CorrectOpeningBalanceDialog from '@/components/bookkeeping/CorrectOpeningBalanceDialog'
 import EditDraftEntryDialog from '@/components/bookkeeping/EditDraftEntryDialog'
 import RecordateEntryDialog from '@/components/bookkeeping/RecordateEntryDialog'
+import AgentSparkleButton from '@/components/agent/AgentSparkleButton'
 import CorrectionChain from '@/components/bookkeeping/CorrectionChain'
 import { ConfirmationDialog } from '@/components/ui/confirmation-dialog'
 import { useToast } from '@/components/ui/use-toast'
@@ -42,9 +45,12 @@ export default function JournalEntryDetailPage({ params }: { params: Promise<{ i
   const [isLoading, setIsLoading] = useState(true)
   const [error, setError] = useState<string | null>(null)
   const [showCorrection, setShowCorrection] = useState(false)
+  const [showCorrectIB, setShowCorrectIB] = useState(false)
   const [showEdit, setShowEdit] = useState(false)
   const [showRecordate, setShowRecordate] = useState(false)
   const [showDeleteConfirm, setShowDeleteConfirm] = useState(false)
+  const [showReverseConfirm, setShowReverseConfirm] = useState(false)
+  const [isReversing, setIsReversing] = useState(false)
   const [isDeleting, setIsDeleting] = useState(false)
   const [isCommitting, setIsCommitting] = useState(false)
   const [isLastInSeries, setIsLastInSeries] = useState(false)
@@ -155,6 +161,33 @@ export default function JournalEntryDetailPage({ params }: { params: Promise<{ i
     }
   }, [id, router, toast, t])
 
+  // Pure reversal (storno) — cancels the verifikat with a stornoverifikation and
+  // no replacement, per BFL 5 kap 5§. Distinct from "Rätta", which always books
+  // a replacement entry. Routes through the engine's reverseEntry (storno +
+  // reverses_id link; original → 'reversed', never deleted).
+  const handleReverse = useCallback(async () => {
+    setIsReversing(true)
+    try {
+      const res = await fetch(`/api/bookkeeping/journal-entries/${id}/reverse`, { method: 'POST' })
+      const result = await res.json()
+      if (res.ok) {
+        const storno = result.data
+        toast({
+          title: t('toast_reverse_done_title'),
+          description: t('toast_reverse_done_description', { voucher: formatVoucher(storno ?? {}) }),
+        })
+        setShowReverseConfirm(false)
+        await fetchData()
+      } else {
+        toast({ title: t('toast_reverse_failed'), description: getErrorMessage(result, { context: 'journal_entry' }), variant: 'destructive' })
+      }
+    } catch {
+      toast({ title: t('toast_reverse_failed'), variant: 'destructive' })
+    } finally {
+      setIsReversing(false)
+    }
+  }, [id, toast, fetchData, t])
+
   useEffect(() => {
     fetchData()
   }, [fetchData])
@@ -207,6 +240,14 @@ export default function JournalEntryDetailPage({ params }: { params: Promise<{ i
   // correction (or the original) and corrects that one.
   const canCorrect = entry.status === 'posted' && entry.source_type !== 'storno'
 
+  // An opening-balance verifikat must be corrected through the IB-aware flow
+  // (storno + rebook + relink the period's opening_balance_entry_id), never the
+  // generic "Rätta rader" — that books a `correction` entry but leaves the
+  // period pointing at the stornoed IB, so the Balansrapport "Ingående balans"
+  // column goes stale. Only surface it on the *active* IB (posted; stornoed
+  // predecessors are `reversed`, so exactly one posted IB exists per period).
+  const isOpeningBalance = entry.source_type === 'opening_balance' && entry.status === 'posted'
+
   // Include current entry in the chain for the visualization
   const fullChain = [entry, ...chain]
 
@@ -225,7 +266,7 @@ export default function JournalEntryDetailPage({ params }: { params: Promise<{ i
       <div className="flex flex-col gap-4 sm:flex-row sm:items-start sm:justify-between">
         <div className="space-y-1">
           <div className="flex items-center gap-2 flex-wrap">
-            <h1 className="font-display text-2xl md:text-3xl font-medium tracking-tight font-mono">
+            <h1 className="font-display text-2xl md:text-3xl tracking-tight font-mono">
               {formatVoucher(entry)}
             </h1>
             <JournalEntryStatusBadge entry={entry} />
@@ -235,6 +276,14 @@ export default function JournalEntryDetailPage({ params }: { params: Promise<{ i
 
         {(entry.status === 'posted' || entry.status === 'draft') && (
           <div className="flex flex-col sm:flex-row gap-2 w-full sm:w-auto">
+            {entry.status === 'draft' && (
+              <AgentSparkleButton
+                intentId="verifikation.draft"
+                intentArgs={{ journal_entry_id: id }}
+                contextRef={`verifikation:${id}`}
+                className="w-full sm:w-auto"
+              />
+            )}
             {entry.status === 'draft' && (
               <Button
                 variant="outline"
@@ -273,7 +322,7 @@ export default function JournalEntryDetailPage({ params }: { params: Promise<{ i
                 {entry.status === 'draft' ? t('delete_draft') : t('delete_entry')}
               </Button>
             )}
-            {canCorrect && (
+            {canCorrect && !isOpeningBalance && (
               <DropdownMenu>
                 <DropdownMenuTrigger asChild>
                   <Button
@@ -297,8 +346,26 @@ export default function JournalEntryDetailPage({ params }: { params: Promise<{ i
                     <CalendarClock className="mr-2 h-4 w-4" />
                     {t('correct_date')}
                   </DropdownMenuItem>
+                  <DropdownMenuSeparator />
+                  <DropdownMenuItem onClick={() => setShowReverseConfirm(true)}>
+                    <RotateCcw className="mr-2 h-4 w-4" />
+                    {t('reverse_action')}
+                  </DropdownMenuItem>
                 </DropdownMenuContent>
               </DropdownMenu>
+            )}
+            {canCorrect && isOpeningBalance && (
+              <Button
+                variant="outline"
+                size="sm"
+                className="w-full sm:w-auto"
+                onClick={() => setShowCorrectIB(true)}
+                disabled={!canWrite}
+                title={!canWrite ? t('read_only_tooltip') : undefined}
+              >
+                {!canWrite ? <Lock className="mr-2 h-4 w-4" /> : <Pencil className="mr-2 h-4 w-4" />}
+                {t('correct_opening_balances')}
+              </Button>
             )}
             {entry.status === 'posted' && (
               <Button
@@ -331,7 +398,7 @@ export default function JournalEntryDetailPage({ params }: { params: Promise<{ i
             {entry.committed_at && (
               <div className="flex justify-between">
                 <span className="text-muted-foreground">{t('field_posted_at')}</span>
-                <span>{new Date(entry.committed_at).toLocaleDateString('sv-SE')}</span>
+                <span>{formatDate(entry.committed_at)}</span>
               </div>
             )}
             <div className="flex justify-between">
@@ -662,6 +729,19 @@ export default function JournalEntryDetailPage({ params }: { params: Promise<{ i
         />
       )}
 
+      {/* Opening-balance correction dialog — IB-aware (storno + rebook + relink) */}
+      {showCorrectIB && entry && (
+        <CorrectOpeningBalanceDialog
+          entry={entry}
+          open={showCorrectIB}
+          onOpenChange={setShowCorrectIB}
+          onCorrected={() => {
+            setShowCorrectIB(false)
+            fetchData()
+          }}
+        />
+      )}
+
       {/* Recordate (move to correct date) dialog */}
       {showRecordate && entry && (
         <RecordateEntryDialog
@@ -709,6 +789,25 @@ export default function JournalEntryDetailPage({ params }: { params: Promise<{ i
             <p className="text-muted-foreground">
               {entry?.status === 'draft' ? t('delete_dialog_draft_body') : t('delete_dialog_entry_body')}
             </p>
+          </div>
+        </div>
+      </ConfirmationDialog>
+
+      {/* Reverse (storno) confirmation dialog */}
+      <ConfirmationDialog
+        open={showReverseConfirm}
+        onOpenChange={setShowReverseConfirm}
+        onConfirm={handleReverse}
+        isSubmitting={isReversing}
+        title={t('reverse_confirm_title')}
+        warningText={t('reverse_warning')}
+        confirmLabel={t('reverse_confirm_label')}
+      >
+        <div className="flex items-start gap-3 rounded-lg border bg-muted/50 p-4">
+          <RotateCcw className="h-5 w-5 text-muted-foreground mt-0.5 shrink-0" />
+          <div className="text-sm">
+            <p className="font-medium mb-1">{t('reverse_dialog_heading', { voucher: formatVoucher(entry) })}</p>
+            <p className="text-muted-foreground">{t('reverse_dialog_body')}</p>
           </div>
         </div>
       </ConfirmationDialog>

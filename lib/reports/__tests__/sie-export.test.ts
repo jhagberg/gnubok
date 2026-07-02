@@ -9,7 +9,7 @@ let results: Array<{ data?: unknown; error?: unknown }>
 
 function makeBuilder() {
   const b: Record<string, unknown> = {}
-  for (const m of ['select', 'eq', 'in', 'order', 'range', 'lt', 'lte', 'gte', 'gt', 'limit']) {
+  for (const m of ['select', 'eq', 'in', 'order', 'range', 'lt', 'lte', 'gte', 'gt', 'limit', 'neq']) {
     b[m] = vi.fn().mockReturnValue(b)
   }
   b.single = vi.fn().mockImplementation(async () => results[resultIdx++] ?? { data: null, error: null })
@@ -46,6 +46,16 @@ const baseOptions = {
   program_name: 'ERPBase',
 }
 
+// Queue consumption order after the pagination fix:
+//   0: fiscal_periods.single()
+//   1: previous fiscal period .single() (#RAR -1)
+//   2: chart_of_accounts        (fetchAllRows)
+//   3: journal_entries          (fetchAllRows)
+//   4: journal_entry_lines      (fetchAllRows)   ← split out from the entries query
+//   5: cost_centers
+//   6: projects
+//   7: opening balances (RPC fallback or journal_entry_lines page)
+
 describe('generateSIEExport', () => {
   it('throws when fiscal period not found', async () => {
     results = [
@@ -59,43 +69,38 @@ describe('generateSIEExport', () => {
 
   it('generates correct header format', async () => {
     results = [
-      // 0: fiscal_periods
       { data: { id: 'period-1', period_start: '2024-01-01', period_end: '2024-12-31' }, error: null },
-      // 1: previous fiscal period (#RAR -1)
-      { data: null, error: null },
-      // 2: chart_of_accounts (empty)
-      { data: [], error: null },
-      // 3: journal_entries (empty)
-      { data: [], error: null },
-      // 4: cost_centers (empty)
-      { data: [], error: null },
-      // 5: projects (empty)
-      { data: [], error: null },
-      // 6: compute_prior_opening_balances RPC (empty — no IB)
-      { data: [], error: null },
+      { data: null, error: null }, // prevPeriod
+      { data: [], error: null }, // accounts
+      { data: [], error: null }, // journal_entries
+      { data: [], error: null }, // journal_entry_lines
+      { data: [], error: null }, // cost_centers
+      { data: [], error: null }, // projects
+      { data: [], error: null }, // opening balances RPC
     ]
 
     const output = await generateSIEExport(supabase, 'company-1', baseOptions)
     const lines = output.split('\r\n')
 
     expect(lines[0]).toBe('#FLAGGA 0')
-    expect(lines[1]).toBe('#FORMAT PC8')
-    expect(lines[2]).toBe('#SIETYP 4')
-    expect(lines[3]).toMatch(/^#PROGRAM "ERPBase" "1\.0"$/)
-    expect(lines[4]).toMatch(/^#GEN \d{8}$/)
-    expect(lines[5]).toBe('#ORGNR 556677-8899')
-    expect(lines[6]).toBe('#FNAMN "Test AB"')
-    expect(lines[7]).toBe('#RAR 0 20240101 20241231')
+    expect(lines[1]).toBe('#SIETYP 4')
+    expect(lines[2]).toMatch(/^#PROGRAM "ERPBase" "1\.0"$/)
+    expect(lines[3]).toMatch(/^#GEN \d{8}$/)
+    expect(lines[4]).toBe('#ORGNR 556677-8899')
+    expect(lines[5]).toBe('#FNAMN "Test AB"')
+    expect(lines[6]).toBe('#RAR 0 20240101 20241231')
+    expect(output).not.toContain('#FORMAT PC8')
   })
 
   it('omits #ORGNR when org_number is null', async () => {
     results = [
       { data: { id: 'period-1', period_start: '2024-01-01', period_end: '2024-12-31' }, error: null },
       { data: null, error: null }, // prevPeriod
-      { data: [], error: null },
-      { data: [], error: null },
-      { data: [], error: null },
-      { data: [], error: null },
+      { data: [], error: null }, // accounts
+      { data: [], error: null }, // journal_entries
+      { data: [], error: null }, // journal_entry_lines
+      { data: [], error: null }, // cost_centers
+      { data: [], error: null }, // projects
       { data: [], error: null }, // RPC fallback
     ]
 
@@ -118,9 +123,10 @@ describe('generateSIEExport', () => {
         ],
         error: null,
       },
-      { data: [], error: null },
-      { data: [], error: null },
-      { data: [], error: null },
+      { data: [], error: null }, // journal_entries
+      { data: [], error: null }, // journal_entry_lines
+      { data: [], error: null }, // cost_centers
+      { data: [], error: null }, // projects
       { data: [], error: null }, // RPC fallback
     ]
 
@@ -139,20 +145,18 @@ describe('generateSIEExport', () => {
       { data: null, error: null }, // prevPeriod
       { data: [], error: null }, // accounts
       {
+        // journal_entries (no embedded lines — those come from the next slot)
         data: [
-          {
-            id: 'e1',
-            entry_date: '2024-03-15',
-            voucher_number: 1,
-            voucher_series: 'A',
-            description: 'Sale invoice',
-            status: 'posted',
-            lines: [
-              { account_number: '1510', debit_amount: 1250, credit_amount: 0, line_description: null, cost_center: null, project: null },
-              { account_number: '3001', debit_amount: 0, credit_amount: 1000, line_description: 'Revenue', cost_center: null, project: null },
-              { account_number: '2611', debit_amount: 0, credit_amount: 250, line_description: null, cost_center: null, project: null },
-            ],
-          },
+          { id: 'e1', entry_date: '2024-03-15', voucher_number: 1, voucher_series: 'A', description: 'Sale invoice', status: 'posted' },
+        ],
+        error: null,
+      },
+      {
+        // journal_entry_lines — each carries journal_entry_id for grouping
+        data: [
+          { journal_entry_id: 'e1', account_number: '1510', debit_amount: 1250, credit_amount: 0, line_description: null, cost_center: null, project: null },
+          { journal_entry_id: 'e1', account_number: '3001', debit_amount: 0, credit_amount: 1000, line_description: 'Revenue', cost_center: null, project: null },
+          { journal_entry_id: 'e1', account_number: '2611', debit_amount: 0, credit_amount: 250, line_description: null, cost_center: null, project: null },
         ],
         error: null,
       },
@@ -175,8 +179,9 @@ describe('generateSIEExport', () => {
     results = [
       { data: { id: 'period-1', period_start: '2024-01-01', period_end: '2024-12-31' }, error: null },
       { data: null, error: null }, // prevPeriod
-      { data: [], error: null },
-      { data: [], error: null },
+      { data: [], error: null }, // accounts
+      { data: [], error: null }, // journal_entries
+      { data: [], error: null }, // journal_entry_lines
       {
         data: [
           { code: 'CC1', name: 'Avdelning 1', is_active: true },
@@ -204,21 +209,17 @@ describe('generateSIEExport', () => {
     results = [
       { data: { id: 'period-1', period_start: '2024-01-01', period_end: '2024-12-31' }, error: null },
       { data: null, error: null }, // prevPeriod
-      { data: [], error: null },
+      { data: [], error: null }, // accounts
       {
         data: [
-          {
-            id: 'e1',
-            entry_date: '2024-03-15',
-            voucher_number: 1,
-            voucher_series: 'A',
-            description: 'With dimensions',
-            status: 'posted',
-            lines: [
-              { account_number: '5010', debit_amount: 8000, credit_amount: 0, line_description: null, cost_center: 'CC1', project: 'P001' },
-              { account_number: '1930', debit_amount: 0, credit_amount: 8000, line_description: null, cost_center: null, project: null },
-            ],
-          },
+          { id: 'e1', entry_date: '2024-03-15', voucher_number: 1, voucher_series: 'A', description: 'With dimensions', status: 'posted' },
+        ],
+        error: null,
+      },
+      {
+        data: [
+          { journal_entry_id: 'e1', account_number: '5010', debit_amount: 8000, credit_amount: 0, line_description: null, cost_center: 'CC1', project: 'P001' },
+          { journal_entry_id: 'e1', account_number: '1930', debit_amount: 0, credit_amount: 8000, line_description: null, cost_center: null, project: null },
         ],
         error: null,
       },
@@ -237,27 +238,23 @@ describe('generateSIEExport', () => {
     results = [
       { data: { id: 'period-1', period_start: '2024-01-01', period_end: '2024-12-31' }, error: null },
       { data: null, error: null }, // prevPeriod
-      { data: [], error: null },
+      { data: [], error: null }, // accounts
       {
         data: [
-          {
-            id: 'e1',
-            entry_date: '2024-01-15',
-            voucher_number: 1,
-            voucher_series: 'A',
-            description: 'Sale',
-            status: 'posted',
-            lines: [
-              { account_number: '1510', debit_amount: 1250, credit_amount: 0, line_description: null, cost_center: null, project: null },
-              { account_number: '3001', debit_amount: 0, credit_amount: 1000, line_description: null, cost_center: null, project: null },
-              { account_number: '2611', debit_amount: 0, credit_amount: 250, line_description: null, cost_center: null, project: null },
-            ],
-          },
+          { id: 'e1', entry_date: '2024-01-15', voucher_number: 1, voucher_series: 'A', description: 'Sale', status: 'posted' },
         ],
         error: null,
       },
-      { data: [], error: null },
-      { data: [], error: null },
+      {
+        data: [
+          { journal_entry_id: 'e1', account_number: '1510', debit_amount: 1250, credit_amount: 0, line_description: null, cost_center: null, project: null },
+          { journal_entry_id: 'e1', account_number: '3001', debit_amount: 0, credit_amount: 1000, line_description: null, cost_center: null, project: null },
+          { journal_entry_id: 'e1', account_number: '2611', debit_amount: 0, credit_amount: 250, line_description: null, cost_center: null, project: null },
+        ],
+        error: null,
+      },
+      { data: [], error: null }, // cost_centers
+      { data: [], error: null }, // projects
       { data: [], error: null }, // RPC fallback
     ]
 
@@ -275,26 +272,22 @@ describe('generateSIEExport', () => {
     results = [
       { data: { id: 'period-1', period_start: '2024-01-01', period_end: '2024-12-31' }, error: null },
       { data: null, error: null }, // prevPeriod
-      { data: [], error: null },
+      { data: [], error: null }, // accounts
       {
         data: [
-          {
-            id: 'e1',
-            entry_date: '2024-01-15',
-            voucher_number: 1,
-            voucher_series: 'A',
-            description: 'Invoice for "consulting"',
-            status: 'posted',
-            lines: [
-              { account_number: '1930', debit_amount: 100, credit_amount: 0, line_description: null, cost_center: null, project: null },
-              { account_number: '3001', debit_amount: 0, credit_amount: 100, line_description: null, cost_center: null, project: null },
-            ],
-          },
+          { id: 'e1', entry_date: '2024-01-15', voucher_number: 1, voucher_series: 'A', description: 'Invoice for "consulting"', status: 'posted' },
         ],
         error: null,
       },
-      { data: [], error: null },
-      { data: [], error: null },
+      {
+        data: [
+          { journal_entry_id: 'e1', account_number: '1930', debit_amount: 100, credit_amount: 0, line_description: null, cost_center: null, project: null },
+          { journal_entry_id: 'e1', account_number: '3001', debit_amount: 0, credit_amount: 100, line_description: null, cost_center: null, project: null },
+        ],
+        error: null,
+      },
+      { data: [], error: null }, // cost_centers
+      { data: [], error: null }, // projects
       { data: [], error: null }, // RPC fallback
     ]
 
@@ -307,10 +300,11 @@ describe('generateSIEExport', () => {
     results = [
       { data: { id: 'period-1', period_start: '2024-01-01', period_end: '2024-12-31' }, error: null },
       { data: null, error: null }, // prevPeriod
-      { data: [], error: null },
-      { data: [], error: null },
-      { data: [], error: null },
-      { data: [], error: null },
+      { data: [], error: null }, // accounts
+      { data: [], error: null }, // journal_entries
+      { data: [], error: null }, // journal_entry_lines
+      { data: [], error: null }, // cost_centers
+      { data: [], error: null }, // projects
       { data: [], error: null }, // RPC fallback
     ]
 
@@ -331,10 +325,11 @@ describe('generateSIEExport', () => {
     results = [
       { data: { id: 'period-1', period_start: '2024-01-01', period_end: '2024-12-31' }, error: null },
       { data: null, error: null }, // prevPeriod
-      { data: [], error: null },
-      { data: [], error: null },
-      { data: [], error: null },
-      { data: [], error: null },
+      { data: [], error: null }, // accounts
+      { data: [], error: null }, // journal_entries
+      { data: [], error: null }, // journal_entry_lines
+      { data: [], error: null }, // cost_centers
+      { data: [], error: null }, // projects
       { data: [], error: null }, // RPC fallback
     ]
 
@@ -348,10 +343,11 @@ describe('generateSIEExport', () => {
     results = [
       { data: { id: 'period-1', period_start: '2024-01-01', period_end: '2024-12-31' }, error: null },
       { data: null, error: null }, // prevPeriod
-      { data: [], error: null },
-      { data: [], error: null },
-      { data: [], error: null },
-      { data: [], error: null },
+      { data: [], error: null }, // accounts
+      { data: [], error: null }, // journal_entries
+      { data: [], error: null }, // journal_entry_lines
+      { data: [], error: null }, // cost_centers
+      { data: [], error: null }, // projects
       { data: [], error: null }, // RPC fallback
     ]
 
@@ -359,6 +355,68 @@ describe('generateSIEExport', () => {
 
     expect(output).not.toContain('#DIM')
     expect(output).not.toContain('#OBJEKT')
+  })
+
+  it('does not truncate large periods — every voucher and its lines are exported', async () => {
+    // Regression test for the user-reported bug: the previous nested
+    // `select('*, lines:journal_entry_lines(*)')` query hit PostgREST's
+    // embedded-resource row ceiling and silently truncated to ~30 vouchers.
+    // The pagination fix fetches entries and lines as separate paginated
+    // queries, so a period far larger than any single page round-trips fully.
+    const ENTRY_COUNT = 2500 // well past the 1000-row PostgREST page size
+
+    const entries = Array.from({ length: ENTRY_COUNT }, (_, i) => ({
+      id: `e${i + 1}`,
+      entry_date: '2024-06-01',
+      voucher_number: i + 1,
+      voucher_series: 'A',
+      description: `Voucher ${i + 1}`,
+      status: 'posted',
+    }))
+
+    const lines = entries.flatMap((e, i) => [
+      { id: `l${i * 2 + 1}`, journal_entry_id: e.id, account_number: '1510', debit_amount: 100, credit_amount: 0, line_description: null, cost_center: null, project: null },
+      { id: `l${i * 2 + 2}`, journal_entry_id: e.id, account_number: '3001', debit_amount: 0, credit_amount: 100, line_description: null, cost_center: null, project: null },
+    ])
+
+    // fetchAllRows paginates at PAGE_SIZE = 1000; chunk the mock data so the
+    // queue mimics real multi-page round-trips and the loop stops on a short page.
+    function paginate<T>(rows: T[]): Array<{ data: T[]; error: null }> {
+      const PAGE = 1000
+      const pages: Array<{ data: T[]; error: null }> = []
+      for (let i = 0; i < rows.length; i += PAGE) {
+        pages.push({ data: rows.slice(i, i + PAGE), error: null })
+      }
+      // Ensure a final short page so fetchAllRows terminates when the data is
+      // an exact multiple of PAGE_SIZE.
+      if (rows.length % PAGE === 0) pages.push({ data: [], error: null })
+      return pages
+    }
+
+    results = [
+      { data: { id: 'period-1', period_start: '2024-01-01', period_end: '2024-12-31' }, error: null },
+      { data: null, error: null }, // prevPeriod
+      { data: [], error: null }, // accounts
+      ...paginate(entries), // journal_entries — 3 pages (1000 + 1000 + 500)
+      ...paginate(lines), // journal_entry_lines — 5000 rows → 5 pages
+      { data: [], error: null }, // cost_centers
+      { data: [], error: null }, // projects
+      { data: [], error: null }, // RPC fallback
+    ]
+
+    const output = await generateSIEExport(supabase, 'company-1', baseOptions)
+
+    // Every voucher present — including the first, last, and a middle one
+    // that the old ~30-row cap would have dropped.
+    const verCount = (output.match(/#VER /g) || []).length
+    expect(verCount).toBe(ENTRY_COUNT)
+    expect(output).toContain('#VER "A" 1 20240601 "Voucher 1"')
+    expect(output).toContain(`#VER "A" 1500 20240601 "Voucher 1500"`)
+    expect(output).toContain(`#VER "A" ${ENTRY_COUNT} 20240601 "Voucher ${ENTRY_COUNT}"`)
+
+    // Lines were stitched onto their entries (two #TRANS per voucher)
+    const transCount = (output.match(/#TRANS /g) || []).length
+    expect(transCount).toBe(ENTRY_COUNT * 2)
   })
 
   it('emits #IB from compute_prior_opening_balances RPC fallback when opening_balance_entry_id is null', async () => {
@@ -374,6 +432,7 @@ describe('generateSIEExport', () => {
       { data: null, error: null }, // prevPeriod
       { data: [], error: null }, // accounts
       { data: [], error: null }, // journal_entries (no movements this period)
+      { data: [], error: null }, // journal_entry_lines
       { data: [], error: null }, // cost_centers
       { data: [], error: null }, // projects
       // RPC fallback returns prior IBs derived from historical journal lines
@@ -404,6 +463,7 @@ describe('generateSIEExport', () => {
       { data: null, error: null }, // prevPeriod
       { data: [], error: null }, // accounts
       { data: [], error: null }, // journal_entries
+      { data: [], error: null }, // journal_entry_lines
       { data: [], error: null }, // cost_centers
       { data: [], error: null }, // projects
       // fetchAllRows page 1 — explicit OB entry lines
@@ -422,5 +482,80 @@ describe('generateSIEExport', () => {
     expect(output).toContain('#IB 0 2440 -12000.00')
     expect(output).toContain('#UB 0 1930 12000.00')
     expect(output).toContain('#UB 0 2440 -12000.00')
+  })
+
+  it('excludes the OB entry from #VER output and #UB movement so a zeroed-out account gets #UB 0', async () => {
+    // Regression: the OB entry was included in both getOpeningBalances (#IB)
+    // and calculateBalances (movement), so its debit cancelled the real net
+    // movement and left #UB = #IB for any account zeroed out during the year.
+    //
+    // Setup: 1933 opens at 96 466,59 (IB), is swept to 0 via a transfer to
+    // 1930 during the year. The OB entry (id: 'ob-entry-1') is returned by
+    // the journal_entries query because it lives in the same fiscal period.
+    results = [
+      { data: { id: 'period-1', period_start: '2024-01-01', period_end: '2024-12-31', opening_balance_entry_id: 'ob-entry-1' }, error: null },
+      { data: null, error: null }, // prevPeriod
+      { data: [], error: null },   // accounts
+      {
+        // journal_entries (fetchAllRows) — no embedded lines; stitched below
+        data: [
+          // The OB entry itself — must be excluded from movement/VER output
+          {
+            id: 'ob-entry-1',
+            entry_date: '2024-01-01',
+            voucher_number: 1,
+            voucher_series: 'A',
+            description: 'IB 2024',
+            status: 'posted',
+          },
+          // A real transaction: account 1933 swept to 1930
+          {
+            id: 'e2',
+            entry_date: '2024-08-07',
+            voucher_number: 2,
+            voucher_series: 'A',
+            description: 'Stängning Bokio',
+            status: 'posted',
+          },
+        ],
+        error: null,
+      },
+      // journal_entry_lines (allLines) — #824 moved per-entry lines into a single
+      // paged join query; lines map back to entries by journal_entry_id (the inline
+      // entry.lines above are overwritten). The OB entry's lines (excluded from
+      // movement via obEntryId) and the real transfer's lines both flow through here.
+      {
+        data: [
+          { id: 'l1', journal_entry_id: 'ob-entry-1', account_number: '1933', debit_amount: 96466.59, credit_amount: 0, line_description: 'IB 1933', cost_center: null, project: null },
+          { id: 'l2', journal_entry_id: 'ob-entry-1', account_number: '2019', debit_amount: 0, credit_amount: 96466.59, line_description: null, cost_center: null, project: null },
+          { id: 'l3', journal_entry_id: 'e2', account_number: '1930', debit_amount: 96466.59, credit_amount: 0, line_description: null, cost_center: null, project: null },
+          { id: 'l4', journal_entry_id: 'e2', account_number: '1933', debit_amount: 0, credit_amount: 96466.59, line_description: null, cost_center: null, project: null },
+        ],
+        error: null,
+      },
+      { data: [], error: null }, // cost_centers
+      { data: [], error: null }, // projects
+      // fetchAllRows for OB entry lines (opening_balance_entry_id is set)
+      {
+        data: [
+          { account_number: '1933', debit_amount: 96466.59, credit_amount: 0 },
+          { account_number: '2019', debit_amount: 0, credit_amount: 96466.59 },
+        ],
+        error: null,
+      },
+    ]
+
+    const output = await generateSIEExport(supabase, 'company-1', baseOptions)
+
+    // IB recorded correctly
+    expect(output).toContain('#IB 0 1933 96466.59')
+    // 1933 was zeroed out: UB must be 0, not a repeat of IB
+    expect(output).toContain('#UB 0 1933 0.00')
+    // 1930 received the sweep: UB = 0 + 96466.59
+    expect(output).toContain('#UB 0 1930 96466.59')
+    // OB entry must NOT appear as a #VER block
+    expect(output).not.toContain('"IB 2024"')
+    // The real transfer entry must appear
+    expect(output).toContain('"Stängning Bokio"')
   })
 })

@@ -17,6 +17,29 @@ function sanitizeProgramName(str: string): string {
  * Format: CP437 encoded text file (we'll use UTF-8 as modern systems accept it)
  * Line format: #TAG field1 field2 ...
  */
+// Unicode codepoint → CP437 byte for characters used in Swedish accounting data.
+// Covers all six Swedish vowel variants plus common Western European accented letters.
+const CP437: Record<number, number> = {
+  0x00C7: 0x80, 0x00FC: 0x81, 0x00E9: 0x82, 0x00E2: 0x83,
+  0x00E4: 0x84, 0x00E0: 0x85, 0x00E5: 0x86, 0x00E7: 0x87,
+  0x00EA: 0x88, 0x00EB: 0x89, 0x00E8: 0x8A, 0x00EF: 0x8B,
+  0x00EE: 0x8C, 0x00EC: 0x8D, 0x00C4: 0x8E, 0x00C5: 0x8F,
+  0x00C9: 0x90, 0x00E6: 0x91, 0x00C6: 0x92, 0x00F4: 0x93,
+  0x00F6: 0x94, 0x00F2: 0x95, 0x00FB: 0x96, 0x00F9: 0x97,
+  0x00FF: 0x98, 0x00D6: 0x99, 0x00DC: 0x9A, 0x00A2: 0x9B,
+  0x00A3: 0x9C, 0x00A5: 0x9D, 0x00E1: 0xA0, 0x00ED: 0xA1,
+  0x00F3: 0xA2, 0x00FA: 0xA3, 0x00F1: 0xA4, 0x00D1: 0xA5,
+}
+
+export function encodeSIEToCP437(text: string): Uint8Array {
+  const bytes: number[] = []
+  for (const char of text) {
+    const cp = char.codePointAt(0)!
+    bytes.push(cp < 0x80 ? cp : (CP437[cp] ?? 0x3F))
+  }
+  return new Uint8Array(bytes)
+}
+
 export async function generateSIEExport(
   supabase: SupabaseClient,
   companyId: string,
@@ -56,20 +79,68 @@ export async function generateSIEExport(
       .range(from, to)
   )
 
-  // Fetch all posted journal entries with lines
-  let entriesQuery = supabase
-    .from('journal_entries')
-    .select('*, lines:journal_entry_lines(*)')
-    .eq('company_id', companyId)
-    .eq('fiscal_period_id', options.fiscal_period_id)
-    .in('status', ['posted', 'reversed'])
-    .order('voucher_number')
+  // Fetch all posted journal entries — paginated to avoid truncation.
+  // The previous nested `select('*, lines:journal_entry_lines(*)')` hit
+  // PostgREST's response-row ceiling on the embedded resource and silently
+  // truncated large periods (~30 vouchers). Fetch entries and lines as two
+  // separate paginated queries and stitch them together in memory, mirroring
+  // journal-register.ts.
+  const entries = await fetchAllRows<JournalEntry>(({ from, to }) => {
+    let q = supabase
+      .from('journal_entries')
+      .select('*')
+      .eq('company_id', companyId)
+      .eq('fiscal_period_id', options.fiscal_period_id)
+      .in('status', ['posted', 'reversed'])
 
-  if (options.exclude_year_end_closing) {
-    entriesQuery = entriesQuery.neq('source_type', 'year_end')
+    if (options.exclude_year_end_closing) {
+      q = q.neq('source_type', 'year_end')
+    }
+
+    // Stable TOTAL order: voucher_series + voucher_number is unique per
+    // company+period, so fetchAllRows paging can't duplicate or skip a voucher
+    // across the 1000-row boundary on large years (voucher_number alone is not
+    // unique across series). dedupeBy is defense-in-depth — see fetch-all.ts.
+    return q
+      .order('voucher_series', { ascending: true })
+      .order('voucher_number', { ascending: true })
+      .range(from, to)
+  }, { dedupeBy: (r) => r.id })
+
+  // Fetch all lines for those entries, filtered server-side via an inner join
+  // so the same company/period/status (and year-end exclusion) constraints
+  // apply, then group by journal_entry_id.
+  const allLines = await fetchAllRows<JournalEntryLine & { journal_entry_id: string }>(({ from, to }) => {
+    let q = supabase
+      .from('journal_entry_lines')
+      .select('*, journal_entries!inner(company_id, fiscal_period_id, status, source_type)')
+      .eq('journal_entries.company_id', companyId)
+      .eq('journal_entries.fiscal_period_id', options.fiscal_period_id)
+      .in('journal_entries.status', ['posted', 'reversed'])
+
+    if (options.exclude_year_end_closing) {
+      q = q.neq('journal_entries.source_type', 'year_end')
+    }
+
+    // Stable total order on the line PK so paging can't duplicate/skip a line
+    // across the 1000-row boundary; dedupeBy is the defense-in-depth net.
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    return q.order('id', { ascending: true }).range(from, to) as any
+  }, { dedupeBy: (r) => r.id })
+
+  const linesByEntryId = new Map<string, JournalEntryLine[]>()
+  for (const line of allLines) {
+    const list = linesByEntryId.get(line.journal_entry_id)
+    if (list) {
+      list.push(line)
+    } else {
+      linesByEntryId.set(line.journal_entry_id, [line])
+    }
   }
 
-  const { data: entries } = await entriesQuery
+  for (const entry of entries) {
+    entry.lines = linesByEntryId.get(entry.id) || []
+  }
 
   // Fetch cost centers and projects for dimension records
   const { data: costCenters } = await supabase
@@ -91,7 +162,7 @@ export async function generateSIEExport(
 
   // === Header ===
   lines.push('#FLAGGA 0')
-  lines.push('#FORMAT PC8')
+  if (options.emit_format_pc8) lines.push('#FORMAT PC8')
   lines.push('#SIETYP 4')
   const programName = sanitizeProgramName(options.program_name || getBranding().appName)
   lines.push(`#PROGRAM "${programName}" "1.0"`)
@@ -150,7 +221,7 @@ export async function generateSIEExport(
   // balances RPC derives IB from earlier journal lines instead of silently
   // emitting zero #IB records and producing wrong #UB values.
   const openingBalancesByAccount = new Map<string, number>()
-  const { balances: obBalances } = await getOpeningBalances(supabase, companyId, {
+  const { balances: obBalances, obEntryId } = await getOpeningBalances(supabase, companyId, {
     period_start: period.period_start,
     opening_balance_entry_id: period.opening_balance_entry_id ?? null,
   })
@@ -162,8 +233,12 @@ export async function generateSIEExport(
     openingBalancesByAccount.set(accountNumber, amount)
   }
 
+  // Exclude the OB entry from VER/TRANS and from movement calculations to
+  // prevent double-counting: it is already represented by the #IB records above.
+  const periodEntries = (entries as JournalEntry[])?.filter(e => e.id !== obEntryId) ?? []
+
   // === Journal entries (VER + TRANS) ===
-  for (const entry of (entries as JournalEntry[]) || []) {
+  for (const entry of periodEntries) {
     const entryLines = (entry.lines as JournalEntryLine[]) || []
     const entryDate = dateStringToSIE(entry.entry_date)
     const series = entry.voucher_series || 'A'
@@ -200,7 +275,7 @@ export async function generateSIEExport(
 
   // === Closing balances (UB for balance sheet, RES for income statement) ===
   // Movement balances from journal entries
-  const movementBalances = calculateBalances(entries as JournalEntry[])
+  const movementBalances = calculateBalances(periodEntries)
 
   // Merge all accounts that have either IB or movements
   const allAccountNumbers = new Set([

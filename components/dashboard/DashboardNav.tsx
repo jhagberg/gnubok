@@ -1,19 +1,19 @@
 'use client'
 
-import { useState, useRef } from 'react'
+import { useEffect, useState, useRef } from 'react'
 import Link from 'next/link'
 import { usePathname, useRouter } from 'next/navigation'
 import { useTranslations } from 'next-intl'
-import { createClient } from '@/lib/supabase/client'
 import { cn } from '@/lib/utils'
 import { Button } from '@/components/ui/button'
 import {
   LayoutDashboard,
   Home,
-  Receipt,
+  ReceiptText,
   Users,
   ArrowLeftRight,
   BookOpen,
+  ListTree,
   BarChart3,
   Settings,
   LogOut,
@@ -50,6 +50,7 @@ import CompanySwitcher from '@/components/dashboard/CompanySwitcher'
 import AgentAvatar from '@/components/agent/AgentAvatar'
 import { useAgentSheet } from '@/components/agent/AgentSheetProvider'
 import { useCompany } from '@/contexts/CompanyContext'
+import { useRealtimeSupabase } from '@/lib/hooks/use-realtime-supabase'
 import type { EntityType } from '@/types'
 
 void _ENABLED_EXTENSION_IDS
@@ -63,6 +64,10 @@ interface ExtensionNavItem {
 interface DashboardNavProps {
   companyName: string
   entityType: EntityType
+  // Whether the company has registered as an employer (company_settings.
+  // pays_salaries). Drives visibility of the payroll (Personal) section for
+  // non-aktiebolag — notably an enskild firma that hires staff. See #782.
+  paysSalaries?: boolean
   uncategorizedTransactionCount?: number
   pendingOperationsCount?: number
   isSandbox?: boolean
@@ -88,6 +93,7 @@ type NavLabelKey =
   | 'review'
   | 'transactions'
   | 'bookkeeping'
+  | 'chart_of_accounts'
   | 'assets'
   | 'reports'
   | 'import'
@@ -113,7 +119,10 @@ interface NavItem {
   labelKey: NavLabelKey
   icon: typeof LayoutDashboard
   group: GroupKey
-  modes?: EntityType[]
+  // Payroll surfaces — visible only to employers: every aktiebolag (unchanged
+  // behaviour) plus any company that has registered as an employer via
+  // company_settings.pays_salaries (e.g. an enskild firma with staff). #782
+  employerOnly?: boolean
   hidden?: boolean
   comingSoon?: boolean
   devBadge?: boolean
@@ -128,7 +137,7 @@ const navItems: NavItem[] = [
   { href: '/transactions', labelKey: 'transactions', icon: ArrowLeftRight, group: 'top' },
   { href: '/pending', labelKey: 'review', icon: ClipboardCheck, group: 'top' },
   // Försäljning dropdown
-  { href: '/invoices', labelKey: 'invoices', icon: Receipt, group: 'försäljning' },
+  { href: '/invoices', labelKey: 'invoices', icon: ReceiptText, group: 'försäljning' },
   { href: '/customers', labelKey: 'customers', icon: Users, group: 'försäljning' },
   { href: '/articles', labelKey: 'articles', icon: Tag, group: 'försäljning' },
   // Inköp dropdown
@@ -137,12 +146,16 @@ const navItems: NavItem[] = [
   // Redovisning dropdown
   { href: '/kpi', labelKey: 'kpi', icon: TrendingUp, group: 'redovisning' },
   { href: '/bookkeeping', labelKey: 'bookkeeping', icon: BookOpen, group: 'redovisning' },
+  { href: '/chart-of-accounts', labelKey: 'chart_of_accounts', icon: ListTree, group: 'redovisning' },
   { href: '/assets', labelKey: 'assets', icon: Package, group: 'redovisning' },
   { href: '/reports', labelKey: 'reports', icon: BarChart3, group: 'redovisning' },
   { href: '/import', labelKey: 'import', icon: Upload, group: 'redovisning' },
   // Personal — "Beta" badge while we validate the end-to-end salary + AGI flow.
-  { href: '/salary', labelKey: 'salary', icon: HandCoins, group: 'personal', modes: ['aktiebolag', 'enskild_firma'], betaBadge: true },
-  { href: '/salary/employees', labelKey: 'employees', icon: Users, group: 'personal', modes: ['aktiebolag', 'enskild_firma'], betaBadge: true },
+  // employerOnly: shown to aktiebolag and to any employer (pays_salaries), so an
+  // enskild firma that hires staff gets payroll. Owner self-payroll stays
+  // blocked at the engine/DB layer (EF owner takes egna uttag, not lön). #782
+  { href: '/salary', labelKey: 'salary', icon: HandCoins, group: 'personal', employerOnly: true, betaBadge: true },
+  { href: '/salary/employees', labelKey: 'employees', icon: Users, group: 'personal', employerOnly: true, betaBadge: true },
 ]
 
 // Map known extension hrefs to nav translation keys so sidebar labels translate.
@@ -172,10 +185,10 @@ function accountInitial(name: string | null, email: string | null): string {
   return '?'
 }
 
-export default function DashboardNav({ companyName: _companyName, entityType, uncategorizedTransactionCount = 0, pendingOperationsCount = 0, isSandbox = false, extensionNavItems = [], userName = null, userEmail = null }: DashboardNavProps) {
+export default function DashboardNav({ companyName: _companyName, entityType, paysSalaries = false, uncategorizedTransactionCount = 0, pendingOperationsCount = 0, isSandbox = false, extensionNavItems = [], userName = null, userEmail = null }: DashboardNavProps) {
   const pathname = usePathname()
   const router = useRouter()
-  const supabase = createClient()
+  const supabase = useRealtimeSupabase()
   const { company } = useCompany()
   // Agent identity drives the "Assistent" nav icon — when the user has
   // built their assistant we show its chosen avatar instead of the
@@ -186,6 +199,11 @@ export default function DashboardNav({ companyName: _companyName, entityType, un
   const [isMobileMenuOpen, setIsMobileMenuOpen] = useState(false)
   const [isClosing, setIsClosing] = useState(false)
   const closeTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null)
+  const [liveUncategorizedTransactionCount, setLiveUncategorizedTransactionCount] = useState(
+    uncategorizedTransactionCount,
+  )
+  const refreshInFlightRef = useRef(false)
+  const refreshQueuedRef = useRef(false)
 
   const hasCompany = !!company
   const ALWAYS_ENABLED = new Set(['/settings'])
@@ -240,6 +258,66 @@ export default function DashboardNav({ companyName: _companyName, entityType, un
     }, 200)
   }
 
+  useEffect(() => {
+    if (!company?.id) return
+
+    let cancelled = false
+
+    const refreshUncategorizedCount = async () => {
+      if (!company?.id || cancelled) return
+      if (refreshInFlightRef.current) {
+        refreshQueuedRef.current = true
+        return
+      }
+
+      refreshInFlightRef.current = true
+      try {
+        do {
+          refreshQueuedRef.current = false
+          const { count, error } = await supabase
+            .from('transactions')
+            .select('id', { count: 'exact', head: true })
+            .eq('company_id', company.id)
+            .is('is_business', null)
+            .eq('is_ignored', false)
+
+          if (error) {
+            console.error('Failed to refresh uncategorized transaction count:', error)
+            break
+          }
+
+          setLiveUncategorizedTransactionCount(count ?? 0)
+        } while (refreshQueuedRef.current && !cancelled)
+      } finally {
+        refreshInFlightRef.current = false
+        refreshQueuedRef.current = false
+      }
+    }
+
+    void refreshUncategorizedCount()
+
+    const channel = supabase
+      .channel(`dashboard-nav:transactions:${company.id}`)
+      .on(
+        'postgres_changes',
+        {
+          event: '*',
+          schema: 'public',
+          table: 'transactions',
+          filter: `company_id=eq.${company.id}`,
+        },
+        () => {
+          void refreshUncategorizedCount()
+        },
+      )
+      .subscribe()
+
+    return () => {
+      cancelled = true
+      void supabase.removeChannel(channel)
+    }
+  }, [company?.id, supabase])
+
   const hiddenNavHrefs = new Set(getBranding().hiddenNavHrefs)
 
   // Render a nav item's leading glyph. The "Assistent" entry (/chat) shows
@@ -265,10 +343,14 @@ export default function DashboardNav({ companyName: _companyName, entityType, un
     return <Icon className={className} />
   }
 
+  const isEmployer = entityType === 'aktiebolag' || paysSalaries
+
   const filteredItems = navItems.filter(item => {
     if (item.hidden) return false
     if (hiddenNavHrefs.has(item.href)) return false
-    if (item.modes && !item.modes.includes(entityType)) return false
+    // Payroll (employerOnly) is hidden until the company is an employer — an
+    // aktiebolag, or any entity that has flagged pays_salaries. #782
+    if (item.employerOnly && !isEmployer) return false
     // Hide the Assistent (/chat) tab until the agent is built — mirrors the
     // floating AgentTrigger and avoids a nav entry that only bounces to the
     // home checklist (chat/layout redirects unverified users to /).
@@ -340,8 +422,8 @@ export default function DashboardNav({ companyName: _companyName, entityType, un
                   const active = isActive(item.href)
                   const enabled = isItemEnabled(item.href)
                   const badge =
-                    item.href === '/transactions' && uncategorizedTransactionCount > 0
-                      ? uncategorizedTransactionCount
+                    item.href === '/transactions' && liveUncategorizedTransactionCount > 0
+                      ? liveUncategorizedTransactionCount
                       : item.href === '/pending' && pendingOperationsCount > 0
                         ? pendingOperationsCount
                         : null
@@ -600,8 +682,8 @@ export default function DashboardNav({ companyName: _companyName, entityType, un
           {mobileNavItems.map((item) => {
             const active = isActive(item.href)
             const enabled = isItemEnabled(item.href)
-            const badge = item.href === '/transactions' && uncategorizedTransactionCount > 0
-              ? uncategorizedTransactionCount
+            const badge = item.href === '/transactions' && liveUncategorizedTransactionCount > 0
+              ? liveUncategorizedTransactionCount
               : null
 
             const content = (
@@ -705,8 +787,8 @@ export default function DashboardNav({ companyName: _companyName, entityType, un
                   const active = isActive(item.href)
                   const enabled = isItemEnabled(item.href)
                   const badge =
-                    item.href === '/transactions' && uncategorizedTransactionCount > 0
-                      ? uncategorizedTransactionCount
+                    item.href === '/transactions' && liveUncategorizedTransactionCount > 0
+                      ? liveUncategorizedTransactionCount
                       : item.href === '/pending' && pendingOperationsCount > 0
                         ? pendingOperationsCount
                         : null
@@ -762,8 +844,8 @@ export default function DashboardNav({ companyName: _companyName, entityType, un
                       const Icon = item.icon
                       const active = isActive(item.href)
                       const enabled = isItemEnabled(item.href) && !item.comingSoon
-                      const badge = item.href === '/transactions' && uncategorizedTransactionCount > 0
-                        ? uncategorizedTransactionCount
+                      const badge = item.href === '/transactions' && liveUncategorizedTransactionCount > 0
+                        ? liveUncategorizedTransactionCount
                         : item.href === '/pending' && pendingOperationsCount > 0
                           ? pendingOperationsCount
                           : null

@@ -813,6 +813,7 @@ const OB_STEP_LABELS: Record<OpeningBalanceStep, string> = {
 
 function OpeningBalanceFlow() {
   const { toast } = useToast()
+  const { dialogProps, confirm } = useDestructiveConfirm()
 
   const [obStep, setObStep] = useState<OpeningBalanceStep>('upload')
   const [obIsLoading, setObIsLoading] = useState(false)
@@ -917,12 +918,27 @@ function OpeningBalanceFlow() {
     setObStep('period')
   }, [])
 
-  const handleExecute = useCallback(async (fiscalPeriodId: string) => {
+  const handleExecute = useCallback(async (fiscalPeriodId: string, replace: boolean) => {
+    if (replace) {
+      const ok = await confirm({
+        title: 'Ersätt ingående balanser?',
+        description:
+          'Den befintliga IB-verifikationen makuleras (stornas) och en ny bokförs med beloppen du angett. Detta går inte att ångra automatiskt.',
+        confirmLabel: 'Ersätt',
+        variant: 'warning',
+      })
+      if (!ok) return
+    }
+
     setObIsLoading(true)
     setObError(null)
 
+    const endpoint = replace
+      ? '/api/import/opening-balance/correct'
+      : '/api/import/opening-balance/execute'
+
     try {
-      const res = await fetch('/api/import/opening-balance/execute', {
+      const res = await fetch(endpoint, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
@@ -938,11 +954,7 @@ function OpeningBalanceFlow() {
       const data = await res.json()
 
       if (!res.ok) {
-        if (res.status === 409) {
-          setObError(data.error || 'Perioden har redan ingående balanser')
-        } else {
-          setObError(data.error || 'Importen misslyckades')
-        }
+        setObError(getErrorMessage(data))
         return
       }
 
@@ -951,7 +963,7 @@ function OpeningBalanceFlow() {
 
       if (data.data.success) {
         toast({
-          title: 'Ingående balanser bokförda',
+          title: replace ? 'Ingående balanser korrigerade' : 'Ingående balanser bokförda',
           description: `${data.data.lines_created} kontorader skapades`,
         })
       }
@@ -960,7 +972,7 @@ function OpeningBalanceFlow() {
     } finally {
       setObIsLoading(false)
     }
-  }, [editedRows, toast])
+  }, [editedRows, toast, confirm])
 
   const handleNewImport = () => {
     setObStep('upload')
@@ -1047,6 +1059,8 @@ function OpeningBalanceFlow() {
           onNewImport={handleNewImport}
         />
       )}
+
+      <DestructiveConfirmDialog {...dialogProps} />
     </div>
   )
 }
@@ -2164,7 +2178,7 @@ export default function ImportPage() {
     <div className="space-y-6">
       {/* Header */}
       <div>
-        <h1 className="font-display text-2xl md:text-3xl font-medium tracking-tight">
+        <h1 className="font-display text-2xl md:text-3xl tracking-tight">
           {view === 'export' ? t('export_title') : t('title')}
         </h1>
         <p className="text-muted-foreground">
@@ -2198,10 +2212,10 @@ export default function ImportPage() {
                 tabIndex={isSandbox ? -1 : 0}
                 aria-disabled={isSandbox}
                 className={cn(
-                  'group flex items-start gap-4 rounded-lg border bg-card p-5 transition-all',
+                  'group flex items-start gap-4 rounded-lg border bg-card p-5 transition-colors',
                   isSandbox
                     ? 'opacity-50 cursor-not-allowed'
-                    : 'cursor-pointer hover:border-foreground/15 hover:shadow-[var(--shadow-sm)] active:scale-[0.998]'
+                    : 'cursor-pointer hover:border-foreground/15'
                 )}
                 onClick={() => { if (!isSandbox) setMode('psd2') }}
                 onKeyDown={(e) => { if (!isSandbox && (e.key === 'Enter' || e.key === ' ')) { e.preventDefault(); setMode('psd2') } }}
@@ -2231,10 +2245,10 @@ export default function ImportPage() {
                 tabIndex={isSandbox ? -1 : 0}
                 aria-disabled={isSandbox}
                 className={cn(
-                  'group rounded-lg border bg-card p-5 transition-all',
+                  'group rounded-lg border bg-card p-5 transition-colors',
                   isSandbox
                     ? 'opacity-50 cursor-not-allowed'
-                    : 'cursor-pointer hover:border-foreground/15 hover:shadow-[var(--shadow-sm)] active:scale-[0.998]'
+                    : 'cursor-pointer hover:border-foreground/15'
                 )}
                 onClick={() => { if (!isSandbox) setMode('migration') }}
                 onKeyDown={(e) => { if (!isSandbox && (e.key === 'Enter' || e.key === ' ')) { e.preventDefault(); setMode('migration') } }}
@@ -2277,8 +2291,8 @@ export default function ImportPage() {
               role="button"
               tabIndex={0}
               className={cn(
-                'group flex items-start gap-4 rounded-lg border bg-card p-5 transition-all',
-                'cursor-pointer hover:border-foreground/15 hover:shadow-[var(--shadow-sm)] active:scale-[0.998]'
+                'group flex items-start gap-4 rounded-lg border bg-card p-5 transition-colors',
+                'cursor-pointer hover:border-foreground/15'
               )}
               onClick={() => setMode('bank')}
               onKeyDown={(e) => { if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); setMode('bank') } }}
@@ -2307,8 +2321,8 @@ export default function ImportPage() {
               role="button"
               tabIndex={0}
               className={cn(
-                'group flex items-start gap-4 rounded-lg border bg-card p-5 transition-all',
-                'cursor-pointer hover:border-foreground/15 hover:shadow-[var(--shadow-sm)] active:scale-[0.998]'
+                'group flex items-start gap-4 rounded-lg border bg-card p-5 transition-colors',
+                'cursor-pointer hover:border-foreground/15'
               )}
               onClick={() => setMode('csv_data')}
               onKeyDown={(e) => { if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); setMode('csv_data') } }}
@@ -2344,8 +2358,8 @@ export default function ImportPage() {
               role="button"
               tabIndex={0}
               className={cn(
-                'group flex items-start gap-4 rounded-lg border bg-card p-5 transition-all',
-                'cursor-pointer hover:border-foreground/15 hover:shadow-[var(--shadow-sm)] active:scale-[0.998]'
+                'group flex items-start gap-4 rounded-lg border bg-card p-5 transition-colors',
+                'cursor-pointer hover:border-foreground/15'
               )}
               onClick={() => setMode('sie')}
               onKeyDown={(e) => { if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); setMode('sie') } }}

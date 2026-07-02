@@ -26,6 +26,7 @@ import {
   calculateVatLiability,
 } from '@/lib/reports/kpi'
 import { generateTrialBalance } from '@/lib/reports/trial-balance'
+import { fetchAllRows } from '@/lib/supabase/fetch-all'
 import { generateARLedger } from '@/lib/reports/ar-ledger'
 import { generateMonthlyBreakdown } from '@/lib/reports/monthly-breakdown'
 import { uiWidgets, findUiWidget, WIDGET_MIME_TYPE } from './widgets'
@@ -70,6 +71,8 @@ import { findDuplicatePaymentCandidatesForInvoice } from '@/lib/invoices/duplica
 import { renderToBuffer } from '@react-pdf/renderer'
 import { InvoicePDF } from '@/lib/invoices/pdf-template'
 import { getEmailService } from '@/lib/email/service'
+import { hasCapability, capabilityBlockedError } from '@/lib/entitlements/has-capability'
+import { MCP_TOOL_CAPABILITY_MAP } from '@/lib/entitlements/keys'
 import {
   generateInvoiceEmailHtml,
   generateInvoiceEmailText,
@@ -1035,18 +1038,26 @@ export async function computeVatReport(
     endDate = `${year}-12-31`
   }
 
-  const { data: lines, error } = await supabase
-    .from('journal_entry_lines')
-    .select('account_number, debit_amount, credit_amount, journal_entries!inner(entry_date, status, user_id)')
-    .eq('journal_entries.company_id', companyId)
-    .in('journal_entries.status', ['posted', 'reversed'])
-    .gte('journal_entries.entry_date', startDate)
-    .lte('journal_entries.entry_date', endDate)
-
-  if (error) throw new Error(`Database error: ${error.message}`)
+  // Paginate. An unbounded .select() caps at PostgREST's 1000-row default,
+  // which silently truncates a yearly (or busy quarterly) VAT period with
+  // >1000 entry lines and under-reports the momsdeklaration.
+  const lines = await fetchAllRows<{
+    account_number: string
+    debit_amount: number
+    credit_amount: number
+  }>(({ from, to }) =>
+    supabase
+      .from('journal_entry_lines')
+      .select('account_number, debit_amount, credit_amount, journal_entries!inner(entry_date, status, user_id)')
+      .eq('journal_entries.company_id', companyId)
+      .in('journal_entries.status', ['posted', 'reversed'])
+      .gte('journal_entries.entry_date', startDate)
+      .lte('journal_entries.entry_date', endDate)
+      .range(from, to)
+  )
 
   const accountTotals = new Map<string, { debit: number; credit: number }>()
-  for (const line of lines ?? []) {
+  for (const line of lines) {
     const acc = line.account_number
     const existing = accountTotals.get(acc) ?? { debit: 0, credit: 0 }
     existing.debit += Number(line.debit_amount) || 0
@@ -3396,47 +3407,26 @@ export const tools: McpTool[] = [
 
       if (!period) throw new Error('Fiscal period not found.')
 
-      // Aggregate journal entry lines
-      const { data: lines, error } = await supabase
-        .from('journal_entry_lines')
-        .select('account_number, debit_amount, credit_amount, journal_entries!inner(status, user_id, fiscal_period_id)')
-        .eq('journal_entries.company_id', companyId)
-        .eq('journal_entries.fiscal_period_id', periodId)
-        .in('journal_entries.status', ['posted', 'reversed'])
+      // Delegate to the canonical, paginated trial-balance builder. The
+      // previous inline query had no pagination, so PostgREST's 1000-row
+      // default silently truncated any period with >1000 entry lines (wrong
+      // sums, false "not balanced"), and it ignored opening balances.
+      // generateTrialBalance paginates and rolls IB forward.
+      const trialBalance = await generateTrialBalance(supabase, companyId, periodId!)
 
-      if (error) throw new Error(`Database error: ${error.message}`)
-
-      // Get account names
-      const { data: accounts } = await supabase
-        .from('chart_of_accounts')
-        .select('account_number, account_name')
-        .eq('company_id', companyId)
-
-      const accountMap = new Map((accounts ?? []).map((a: { account_number: string; account_name: string }) => [a.account_number, a.account_name]))
-
-      // Aggregate by account
-      const totals = new Map<string, { debit: number; credit: number }>()
-      for (const line of lines ?? []) {
-        const acc = line.account_number
-        const existing = totals.get(acc) ?? { debit: 0, credit: 0 }
-        existing.debit += Number(line.debit_amount) || 0
-        existing.credit += Number(line.credit_amount) || 0
-        totals.set(acc, existing)
-      }
-
-      const rows = Array.from(totals.entries())
-        .sort(([a], [b]) => a.localeCompare(b))
-        .map(([accNum, t]) => {
-          const net = Math.round((t.debit - t.credit) * 100) / 100
+      const rows = trialBalance.rows
+        .map((r) => {
+          const net = Math.round((r.closing_debit - r.closing_credit) * 100) / 100
           return {
-            account_number: accNum,
-            account_name: accountMap.get(accNum) ?? accNum,
-            period_debit: Math.round(t.debit * 100) / 100,
-            period_credit: Math.round(t.credit * 100) / 100,
+            account_number: r.account_number,
+            account_name: r.account_name,
+            period_debit: r.period_debit,
+            period_credit: r.period_credit,
             closing_debit: net > 0 ? net : 0,
             closing_credit: net < 0 ? Math.abs(net) : 0,
           }
         })
+        .sort((a, b) => a.account_number.localeCompare(b.account_number))
 
       const totalDebit = Math.round(rows.reduce((s, r) => s + r.closing_debit, 0) * 100) / 100
       const totalCredit = Math.round(rows.reduce((s, r) => s + r.closing_credit, 0) * 100) / 100
@@ -5426,6 +5416,126 @@ export const tools: McpTool[] = [
   },
 
   {
+    name: 'gnubok_bulk_book_inbox_items',
+    title: 'Bulk-Book Underlag',
+    description: 'Bulk-book N selected Underlag (Dokumentinkorgen) against their matched bank transactions with one shared category + VAT treatment. Set reverse_charge for foreign SaaS. Unmatched/booked items are skipped. Stages one approval.',
+    inputSchema: {
+      type: 'object',
+      additionalProperties: false,
+      properties: {
+        item_ids: {
+          type: 'array',
+          minItems: 1,
+          maxItems: 200,
+          items: { type: 'string' },
+          description: "Inbox item UUIDs to book — the user's selection in the Underlag view.",
+        },
+        category: { type: 'string', description: 'Shared transaction category applied to every item', enum: [...VALID_CATEGORIES] },
+        vat_treatment: { type: 'string', description: 'Shared VAT treatment. Set reverse_charge for foreign services (omvänd skattskyldighet) where the seller did NOT charge VAT — typical for USD/EUR SaaS subscriptions like Cursor/Anysphere. Defaults to standard_25.', enum: [...VALID_VAT_TREATMENTS] },
+        vat_amount: { type: 'number', exclusiveMinimum: 0, description: "The underlag's exact moms override; only valid with a rate-based vat_treatment. Rarely needed in bulk — all items share one value." },
+        notes: { type: 'string', description: 'Audit-trail note appended to every verifikation. Keep under 200 chars.' },
+        allow_duplicate: { type: 'boolean', description: 'Override the per-item duplicate-booking guard (default false). Set true only after the user confirms these bank lines are genuinely separate events.' },
+      },
+      required: ['item_ids', 'category'],
+    },
+    outputSchema: STAGED_OPERATION_SCHEMA,
+    annotations: {
+      readOnlyHint: false,
+      destructiveHint: false,
+      idempotentHint: false,
+      openWorldHint: false,
+    },
+    async execute(args, companyId, userId, supabase, actor) {
+      const itemIds = args.item_ids as string[]
+      if (!Array.isArray(itemIds) || itemIds.length === 0) throw new Error('item_ids is required (non-empty)')
+      const vatAmount = typeof args.vat_amount === 'number' && Number.isFinite(args.vat_amount)
+        ? args.vat_amount
+        : undefined
+      const notes = typeof args.notes === 'string' && args.notes.trim().length > 0
+        ? args.notes.trim()
+        : undefined
+
+      // Pre-flight: classify the selection so the preview (and the agent) sees
+      // the real shape before staging. Tenant isolation via company_id.
+      const { data: items, error } = await supabase
+        .from('invoice_inbox_items')
+        .select('id, matched_transaction_id, created_journal_entry_id, created_supplier_invoice_id')
+        .in('id', itemIds)
+        .eq('company_id', companyId)
+      if (error) throw new Error(`Kunde inte läsa underlagen: ${error.message}`)
+
+      const found = new Set((items ?? []).map((it) => it.id as string))
+      const resolved = (items ?? []).filter((it) => it.created_journal_entry_id || it.created_supplier_invoice_id)
+      const bookable = (items ?? []).filter(
+        (it) => it.matched_transaction_id && !it.created_journal_entry_id && !it.created_supplier_invoice_id,
+      )
+      const notMatched = (items ?? []).filter(
+        (it) => !it.matched_transaction_id && !it.created_journal_entry_id && !it.created_supplier_invoice_id,
+      ).length
+      const alreadyBooked = resolved.length
+      const notFound = itemIds.filter((id) => !found.has(id)).length
+
+      if (bookable.length === 0) {
+        throw new Error(
+          `Inga av de ${itemIds.length} valda underlagen kan bokföras: ${notMatched} saknar matchad banktransaktion, ` +
+          `${alreadyBooked} är redan bokförda, ${notFound} hittades inte. Matcha underlagen mot en banktransaktion först ` +
+          `(gnubok_match_transaction_to_invoice eller "Matcha mot transaktion" i Dokumentinkorgen).`,
+        )
+      }
+
+      // Resolve matched-tx dates/amounts for the period envelope + an aggregate
+      // total. preview_data carries only aggregate counts + sum — no per-item
+      // PII (GDPR Art.25), same rationale as gnubok_bulk_book_transactions.
+      const txIds = bookable.map((it) => it.matched_transaction_id as string)
+      const { data: txs } = await supabase
+        .from('transactions')
+        .select('id, date, amount, currency, amount_sek, exchange_rate')
+        .in('id', txIds)
+        .eq('company_id', companyId)
+      const txDates = (txs ?? []).map((t) => t.date as string).filter(Boolean).sort()
+      const earliestDate = txDates[0]
+      const totalSek = (txs ?? []).reduce((s, t) => {
+        const cur = String(t.currency ?? 'SEK').toUpperCase()
+        const sek = cur === 'SEK'
+          ? Math.abs(Number(t.amount))
+          : Math.abs(Number(t.amount_sek ?? Number(t.amount) * Number(t.exchange_rate ?? 1)))
+        return s + (Number.isFinite(sek) ? sek : 0)
+      }, 0)
+
+      return stagePendingOperation(supabase, companyId, userId, 'bulk_book_inbox_items',
+        `Bulkbokför ${bookable.length} underlag`,
+        {
+          // Stage only the bookable items — the executor re-checks each and
+          // skips any that changed state between staging and approval.
+          item_ids: bookable.map((it) => it.id as string),
+          category: args.category,
+          vat_treatment: args.vat_treatment ?? null,
+          vat_amount: vatAmount ?? null,
+          notes: notes ?? null,
+          allow_duplicate: args.allow_duplicate === true,
+        },
+        {
+          item_count: itemIds.length,
+          bookable_count: bookable.length,
+          will_skip_count: notMatched + alreadyBooked + notFound,
+          not_matched: notMatched,
+          already_booked: alreadyBooked,
+          not_found: notFound,
+          total_sek: Math.round(totalSek * 100) / 100,
+          category: args.category,
+          vat_treatment: args.vat_treatment ?? null,
+        },
+        actor,
+        {
+          description: 'After approval each underlag is booked against its matched transaction. Verify with gnubok_list_inbox_items or gnubok_query_journal.',
+          tool: 'gnubok_list_inbox_items',
+        },
+        earliestDate ? { dateForPeriodCheck: earliestDate } : {},
+      )
+    },
+  },
+
+  {
     name: 'gnubok_find_voucher_candidates_for_invoice',
     title: 'Find Voucher Candidates (Invoice)',
     description: "List posted verifikat that could be this invoice's payment (faktureringsmetoden: credit 1510; kontantmetoden: debit 19xx). Call before gnubok_link_invoice_to_voucher to mark the faktura paid (no new bokföring).",
@@ -6288,6 +6398,19 @@ export const tools: McpTool[] = [
         supplier_id_override: { type: 'string', description: 'Force this supplier UUID instead of the matched/extracted one' },
         vat_treatment_override: { type: 'string', enum: ['standard_25', 'reduced_12', 'reduced_6', 'reverse_charge', 'export', 'exempt'], description: 'Override extracted VAT treatment' },
         due_date_override: { type: 'string', description: 'Override extracted due date (YYYY-MM-DD)' },
+        line_overrides: {
+          type: 'array',
+          description: 'Per-line account overrides (1-based line_number). Wins over accountSuggestion and supplier default.',
+          items: {
+            type: 'object',
+            additionalProperties: false,
+            properties: {
+              line_number: { type: 'number', description: '1-based index matching items_preview' },
+              account_number: { type: 'string', description: 'BAS account number for this line (e.g. "6420")' },
+            },
+            required: ['line_number', 'account_number'],
+          },
+        },
         notes: { type: 'string', description: 'Optional notes appended to the supplier invoice' },
         dry_run: { type: 'boolean', description: 'If true, return the assembled payload without staging (default false)' },
         idempotency_key: { type: 'string', description: 'UUID. Repeat calls with same key + payload return cached response.' },
@@ -6407,19 +6530,26 @@ export const tools: McpTool[] = [
         }
       }
 
+      // Build a lookup for per-line account overrides keyed by 1-based line number.
+      const rawLineOverrides = (args.line_overrides as Array<{ line_number: number; account_number: string }> | undefined) ?? []
+      const lineOverrideMap = new Map(rawLineOverrides.map((o) => [o.line_number, o.account_number]))
+
       // Translate extracted line items into the supplier_invoice_items shape.
-      // Priority: per-line accountSuggestion → supplier.default_expense_account → 4000.
-      const lineItems = lineItemsExt.map((li, idx) => ({
-        line_number: idx + 1,
-        description: (li.description as string) ?? `Position ${idx + 1}`,
-        quantity: Number(li.quantity) || 1,
-        unit: (li.unit as string) ?? 'st',
-        unit_price: Number(li.unit_price ?? li.unitPrice ?? li.amount) || 0,
-        line_total: Number(li.line_total ?? li.lineTotal ?? li.amount) || 0,
-        account_number: (li.accountSuggestion as string | null) ?? supplierDefaultExpenseAccount ?? '4000',
-        vat_rate: Number(li.vat_rate ?? li.vatRate) || 0,
-        vat_amount: Number(li.vat_amount ?? li.vatAmount) || 0,
-      }))
+      // Priority: line_overrides → per-line accountSuggestion → supplier.default_expense_account → 4000.
+      const lineItems = lineItemsExt.map((li, idx) => {
+        const lineNumber = idx + 1
+        return {
+          line_number: lineNumber,
+          description: (li.description as string) ?? `Position ${lineNumber}`,
+          quantity: Number(li.quantity) || 1,
+          unit: (li.unit as string) ?? 'st',
+          unit_price: Number(li.unit_price ?? li.unitPrice ?? li.amount) || 0,
+          line_total: Number(li.line_total ?? li.lineTotal ?? li.amount) || 0,
+          account_number: lineOverrideMap.get(lineNumber) ?? (li.accountSuggestion as string | null) ?? supplierDefaultExpenseAccount ?? '4000',
+          vat_rate: Number(li.vat_rate ?? li.vatRate) || 0,
+          vat_amount: Number(li.vat_amount ?? li.vatAmount) || 0,
+        }
+      })
 
       const params = {
         inbox_item_id: inboxItemId,
@@ -6825,6 +6955,95 @@ export const tools: McpTool[] = [
           // becomes part of the verifikation underlag once categorize
           // propagates it (BFL 5 kap 6 § rättelse-räkenskapsinformation).
           dateForPeriodCheck: typeof tx.date === 'string' ? tx.date : undefined,
+        }
+      )
+    },
+  },
+  {
+    name: 'gnubok_link_document_to_voucher',
+    title: 'Link Document to Voucher',
+    description: 'Stage linking a document to a posted verifikation. Use for imported/manual vouchers with no bank-tx row. Call gnubok_list_verifikat_without_documents first to find targets. Stages for approval.',
+    inputSchema: {
+      type: 'object',
+      additionalProperties: false,
+      properties: {
+        document_id: { type: 'string', description: 'UUID of the document_attachments row' },
+        journal_entry_id: { type: 'string', description: 'UUID of the target journal entry (verifikation)' },
+        journal_entry_line_id: { type: 'string', description: 'Optional UUID to pin the doc to a specific debit/credit line' },
+        idempotency_key: { type: 'string', description: 'Optional UUID to dedupe retries' },
+        dry_run: { type: 'boolean', description: 'Preview without staging' },
+      },
+      required: ['document_id', 'journal_entry_id'],
+    },
+    outputSchema: STAGED_OPERATION_SCHEMA,
+    annotations: {
+      readOnlyHint: false,
+      destructiveHint: false,
+      idempotentHint: true,
+      openWorldHint: false,
+    },
+    async execute(args, companyId, userId, supabase, actor) {
+      const documentId = args.document_id as string
+      const journalEntryId = args.journal_entry_id as string
+      const journalEntryLineId = typeof args.journal_entry_line_id === 'string' ? args.journal_entry_line_id : undefined
+      if (!documentId) throw new Error('document_id is required')
+      if (!journalEntryId) throw new Error('journal_entry_id is required')
+
+      const [docRes, jeRes] = await Promise.all([
+        supabase
+          .from('document_attachments')
+          .select('id, file_name, mime_type, journal_entry_id')
+          .eq('id', documentId)
+          .eq('company_id', companyId)
+          .maybeSingle(),
+        supabase
+          .from('journal_entries')
+          .select('id, entry_date, description, voucher_series, voucher_number, status')
+          .eq('id', journalEntryId)
+          .eq('company_id', companyId)
+          .maybeSingle(),
+      ])
+
+      if (docRes.error || !docRes.data) throw new Error('Document not found')
+      if (jeRes.error || !jeRes.data) throw new Error('Journal entry not found')
+
+      const doc = docRes.data as {
+        id: string; file_name: string; mime_type: string; journal_entry_id: string | null
+      }
+      const je = jeRes.data as {
+        id: string; entry_date: string; description: string
+        voucher_series: string | null; voucher_number: number | null; status: string
+      }
+
+      const voucherLabel = je.voucher_series && je.voucher_number
+        ? `${je.voucher_series}${je.voucher_number}`
+        : je.id.slice(0, 8)
+
+      const currentlyLinkedToSameJe = doc.journal_entry_id === journalEntryId
+      const currentlyLinkedToOther = !!doc.journal_entry_id && !currentlyLinkedToSameJe
+
+      return stagePendingOperation(
+        supabase, companyId, userId, 'link_document_to_voucher',
+        `Koppla bilaga: ${doc.file_name} → verifikat ${voucherLabel}`,
+        { document_id: documentId, journal_entry_id: journalEntryId, journal_entry_line_id: journalEntryLineId ?? null },
+        {
+          document_file_name: doc.file_name,
+          document_mime_type: doc.mime_type,
+          document_already_linked: currentlyLinkedToSameJe,
+          document_currently_linked_to_other: currentlyLinkedToOther,
+          document_current_journal_entry_id: doc.journal_entry_id ?? null,
+          voucher_label: voucherLabel,
+          voucher_date: je.entry_date,
+          voucher_description: je.description,
+          voucher_status: je.status,
+          journal_entry_line_id: journalEntryLineId ?? null,
+        },
+        actor,
+        undefined,
+        {
+          idempotencyKey: typeof args.idempotency_key === 'string' ? args.idempotency_key : undefined,
+          dryRun: args.dry_run === true,
+          dateForPeriodCheck: je.entry_date,
         }
       )
     },
@@ -9885,7 +10104,7 @@ function emitToolCallTelemetry(payload: {
   success: boolean
   isError: boolean
   errorCode: string | null
-  errorKind: 'execution' | 'scope_denied' | 'unknown_tool' | null
+  errorKind: 'execution' | 'scope_denied' | 'capability_denied' | 'unknown_tool' | null
   errorMessage: string | null
   requestId: string | number | null
   userId: string
@@ -10335,6 +10554,35 @@ export async function handleMcpRequest(request: Request): Promise<Response> {
         return NextResponse.json(
           jsonRpc(id ?? null, {
             content: [{ type: 'text', text: JSON.stringify(scopeError, null, 2) }],
+            isError: true,
+          })
+        )
+      }
+
+      // Enforce the capability paywall — the MCP/agent path is a paid chokepoint
+      // just like the HTTP routes (send_invoice → email_send, the two SKV
+      // submissions → skatteverket). Fail-closed; self-hosted short-circuits to
+      // all-on inside hasCapability. Blocks before any pending op is staged.
+      const requiredCapability = MCP_TOOL_CAPABILITY_MAP[toolName]
+      if (requiredCapability && !(await hasCapability(supabase, companyId, requiredCapability))) {
+        const capError = { error: capabilityBlockedError(requiredCapability) }
+        emitToolCallTelemetry({
+          tool: toolName,
+          requiredScope,
+          actor,
+          latencyMs: 0,
+          success: false,
+          isError: true,
+          errorCode: capError.error.code,
+          errorKind: 'capability_denied',
+          errorMessage: capError.error.message_sv,
+          requestId: id ?? null,
+          userId,
+          companyId,
+        })
+        return NextResponse.json(
+          jsonRpc(id ?? null, {
+            content: [{ type: 'text', text: JSON.stringify(capError, null, 2) }],
             isError: true,
           })
         )

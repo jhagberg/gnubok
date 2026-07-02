@@ -15,9 +15,7 @@
  */
 import type { SupabaseClient } from '@supabase/supabase-js'
 import { eventBus } from '@/lib/events'
-import { buildMappingResultFromCategory } from '@/lib/bookkeeping/category-mapping'
-import { createTransactionJournalEntry } from '@/lib/bookkeeping/transaction-entries'
-import { upsertCounterpartyTemplate } from '@/lib/bookkeeping/counterparty-templates'
+import { bulkBookMatchedInboxItems, categorizeMatchedTransaction } from '@/lib/transactions/categorize-core'
 import { getVatRules, getAvailableVatRates } from '@/lib/invoices/vat-rules'
 import { fetchExchangeRate, convertToSEK } from '@/lib/currency/riksbanken'
 import { validateVatNumber } from '@/lib/vat/vies-client'
@@ -28,6 +26,7 @@ import {
   createCreditNoteJournalEntry,
 } from '@/lib/bookkeeping/invoice-entries'
 import { createJournalEntry, findFiscalPeriod, reverseEntry, validateBalance } from '@/lib/bookkeeping/engine'
+import { cancelOrphanedPaymentEntry } from '@/lib/bookkeeping/cancel-orphaned-entry'
 import { runWithActor } from '@/lib/bookkeeping/actor-context-node'
 import type { CommitActor } from '@/lib/bookkeeping/actor-context'
 import { correctEntry } from '@/lib/core/bookkeeping/storno-service'
@@ -43,7 +42,6 @@ import {
 } from '@/lib/bookkeeping/supplier-invoice-entries'
 import { linkInvoiceToVoucher } from '@/lib/invoices/voucher-matching'
 import { planInvoicePayment } from '@/lib/invoices/apply-invoice-payment'
-import { detectBookingDuplicate } from '@/lib/transactions/booking-duplicate-detection'
 import { findDuplicatePaymentCandidatesForInvoice } from '@/lib/invoices/duplicate-payment-candidates'
 import { linkSupplierInvoiceToVoucher } from '@/lib/invoices/supplier-voucher-matching'
 import { linkTransactionToJournalEntry } from '@/lib/transactions/link-journal-entry'
@@ -59,6 +57,8 @@ import {
   type SkvSubmitResult,
 } from '@/lib/pending-operations/skatteverket-commit'
 import { getEmailService } from '@/lib/email/service'
+import { hasCapability, CAPABILITY_BLOCKED_MESSAGE_SV } from '@/lib/entitlements/has-capability'
+import { PAID_OPERATION_CAPABILITY_MAP } from '@/lib/entitlements/keys'
 import {
   generateInvoiceEmailHtml,
   generateInvoiceEmailText,
@@ -71,9 +71,9 @@ import { prepareInvoicePdfRender, buildSwishQrDataUrl } from '@/lib/invoices/pdf
 import { ensureInvoiceNumber } from '@/lib/invoices/ensure-invoice-number'
 import { createLogger } from '@/lib/logger'
 import { appendProcessingHistory } from '@/lib/processing-history/append'
-import { roundOre } from '@/lib/money'
 import { CreateSupplierParamsSchema } from '@/lib/pending-operations/schemas/create-supplier'
 import { CreateArticleParamsSchema, UpdateArticleParamsSchema } from '@/lib/pending-operations/schemas/article'
+import { BulkBookInboxSchema } from '@/lib/api/schemas'
 import { ensureArticleNumber } from '@/lib/articles/ensure-article-number'
 import { isValidRevenueAccount } from '@/lib/articles/validate-revenue-account'
 import { z } from 'zod'
@@ -144,67 +144,9 @@ export interface CommitOptions {
   actor?: CommitActor
 }
 
-// ── Helper: ensure fiscal period covers the date ──────────────────
-
-async function ensureFiscalPeriod(
-  supabase: SupabaseClient,
-  userId: string,
-  companyId: string,
-  date: string,
-  fiscalYearStartMonth: number = 1
-): Promise<boolean> {
-  const { data: existing } = await supabase
-    .from('fiscal_periods')
-    .select('id')
-    .eq('company_id', companyId)
-    .lte('period_start', date)
-    .gte('period_end', date)
-    .eq('is_closed', false)
-    .limit(1)
-
-  if (existing && existing.length > 0) return true
-
-  const txDate = new Date(date)
-  const txMonth = txDate.getMonth() + 1
-  const txYear = txDate.getFullYear()
-
-  let periodStartYear: number
-  if (fiscalYearStartMonth === 1) {
-    periodStartYear = txYear
-  } else if (txMonth >= fiscalYearStartMonth) {
-    periodStartYear = txYear
-  } else {
-    periodStartYear = txYear - 1
-  }
-
-  const startMonth = String(fiscalYearStartMonth).padStart(2, '0')
-  const periodStart = `${periodStartYear}-${startMonth}-01`
-
-  const endYear = fiscalYearStartMonth === 1 ? periodStartYear : periodStartYear + 1
-  const endMonth = fiscalYearStartMonth === 1 ? 12 : fiscalYearStartMonth - 1
-  const lastDay = new Date(endYear, endMonth, 0).getDate()
-  const periodEnd = `${endYear}-${String(endMonth).padStart(2, '0')}-${String(lastDay).padStart(2, '0')}`
-
-  const periodName = fiscalYearStartMonth === 1
-    ? `Räkenskapsår ${periodStartYear}`
-    : `Räkenskapsår ${periodStartYear}/${endYear}`
-
-  const { error } = await supabase
-    .from('fiscal_periods')
-    .upsert({
-      user_id: userId,
-      company_id: companyId,
-      name: periodName,
-      period_start: periodStart,
-      period_end: periodEnd,
-    }, { onConflict: 'user_id,period_start,period_end' })
-
-  if (error) {
-    log.error('Failed to create fiscal period:', error)
-    return false
-  }
-  return true
-}
+// ensureFiscalPeriod moved to lib/transactions/categorize-core.ts (imported
+// above) so the bulk-book-inbox path and the single-categorize path share one
+// implementation.
 
 async function recordSkippedInvoiceJournalEntry(
   invoiceId: string,
@@ -267,203 +209,17 @@ async function commitCategorizeTransaction(
       ? params.vat_amount
       : undefined
 
-  const { data: transaction, error: fetchError } = await supabase
-    .from('transactions').select('*').eq('id', txId).eq('company_id', companyId).single()
-
-  if (fetchError || !transaction) {
-    return { error: 'Transaction not found — it may have been deleted.', status: 404 }
-  }
-  if (transaction.journal_entry_id) {
-    return { error: 'Transaction already has a journal entry — it was categorized in the meantime.', status: 409 }
-  }
-
-  // Booking-time duplicate guard — parity with the web /categorize route, which
-  // the agent path otherwise bypassed entirely. Refuse to mint a second
-  // verifikat for an affärshändelse already in the ledger: an already-booked
-  // sibling transaction, OR an unlinked voucher that already books this amount
-  // on the bank account (invoice "markera som betald", the salary run's net-wage
-  // payout, a manual verifikat). The agent has no interactive "Bokför ändå", so
-  // it fails closed; re-stage with allow_duplicate=true after the user confirms
-  // in chat that the bank line is a genuinely separate event. Fail-open on a
-  // detection error so a transient query failure never blocks a real booking.
-  if (params.allow_duplicate !== true) {
-    let dup = null
-    try {
-      dup = await detectBookingDuplicate(supabase, companyId, {
-        id: txId,
-        date: transaction.date,
-        amount: transaction.amount,
-        cash_account_id: transaction.cash_account_id ?? null,
-      })
-    } catch (err) {
-      log.warn('booking-time duplicate detection failed (continuing)', err)
-    }
-    if (dup) {
-      const amountAbs = roundOre(Math.abs(Number(transaction.amount)))
-      const voucher = dup.voucher_label ? `verifikat ${dup.voucher_label}` : 'en befintlig verifikation'
-      return {
-        error:
-          `Möjlig dubblettbokföring: ${voucher} (${dup.entry_date}) bokför redan ${amountAbs} kr på bankkontot. ` +
-          `Den här affärshändelsen ser redan ut att vara bokförd — länka transaktionen till den befintliga ` +
-          `verifikationen i stället för att bokföra den igen. Om banktransaktionen verkligen är en separat ` +
-          `affärshändelse, kör om med allow_duplicate=true.`,
-        status: 409,
-      }
-    }
-  } else {
-    // allow_duplicate=true bypassed the guard. Booking over a possible
-    // double-booking is a bookkeeping act that must leave a durable
-    // behandlingshistorik record (BFNAR 2013:2 kap 8) — the web /book and
-    // /categorize routes log BankTransactionDuplicateDismissed, and the agent
-    // commit path must reach parity so an auditor can reconstruct why the
-    // duplicate was allowed. Re-detect to capture the dismissed candidate;
-    // best-effort, a logging failure must never block a legitimate booking.
-    try {
-      const dismissed = await detectBookingDuplicate(supabase, companyId, {
-        id: txId,
-        date: transaction.date,
-        amount: transaction.amount,
-        cash_account_id: transaction.cash_account_id ?? null,
-      })
-      if (dismissed) {
-        await appendProcessingHistory({
-          companyId,
-          correlationId: txId,
-          aggregateType: 'BankTransaction',
-          aggregateId: txId,
-          eventType: 'BankTransactionDuplicateDismissed',
-          payload: {
-            transaction_id: txId,
-            dismissed_transaction_id: dismissed.transaction_id,
-            dismissed_journal_entry_id: dismissed.journal_entry_id,
-            amount_ore: Math.round(dismissed.amount * 100),
-            entry_date: dismissed.entry_date,
-            via: 'allow_duplicate',
-          },
-          actor: { type: 'user', id: userId },
-          occurredAt: new Date(),
-        })
-      }
-    } catch (logErr) {
-      log.warn('failed to record duplicate-dismissal behandlingshistorik', logErr)
-    }
-  }
-
-  const isBusiness = category !== 'private'
-
-  const { data: settings } = await supabase
-    .from('company_settings').select('entity_type, fiscal_year_start_month').eq('company_id', companyId).single()
-
-  const entityType: EntityType = (settings?.entity_type as EntityType) || 'enskild_firma'
-  const fiscalYearStartMonth = settings?.fiscal_year_start_month ?? 1
-
-  const mappingResult = buildMappingResultFromCategory(
-    category, transaction as Transaction, isBusiness, entityType, vatTreatment, vatAmount
-  )
-
-  if (!mappingResult.debit_account || !mappingResult.credit_account) {
-    return { error: `No account mapping for category "${category}" with entity type "${entityType}".`, status: 400 }
-  }
-
-  await ensureFiscalPeriod(supabase, userId, companyId, transaction.date, fiscalYearStartMonth)
-
-  let journalEntryId: string | null = null
-  try {
-    const journalEntry = await createTransactionJournalEntry(
-      supabase, companyId, userId, transaction as Transaction, mappingResult, notes,
-    )
-    if (journalEntry) journalEntryId = journalEntry.id
-  } catch (err) {
-    if (isBookkeepingError(err)) throw err
-    log.error('Failed to create journal entry:', err)
-    return { error: err instanceof Error ? err.message : 'Failed to create journal entry', status: 500 }
-  }
-
-  const { error: updateError } = await supabase
-    .from('transactions')
-    .update({ is_business: isBusiness, category, journal_entry_id: journalEntryId })
-    .eq('id', txId)
-
-  if (updateError) {
-    log.error('Failed to update transaction:', updateError)
-    return { error: 'Failed to update transaction', status: 500 }
-  }
-
-  // Propagate the underlag from a matched invoice-inbox item onto the new
-  // verifikation. Without this, BFL 7 kap is violated: a verifikation
-  // exists with no underlag attached even though the user has explicitly
-  // linked an inbox item (with a document) to this transaction in the
-  // inbox workspace. We:
-  //   1. find the inbox item(s) where matched_transaction_id = txId
-  //   2. for each item with a document_id, set
-  //        document_attachments.journal_entry_id = journalEntryId
-  //      (idempotent — re-linking the same doc is a no-op write).
-  //   3. stamp invoice_inbox_items.created_journal_entry_id so the inbox
-  //      row visibly moves to "Bearbetade" and shows "Öppna verifikation".
-  // Errors are logged but don't fail the commit — the verifikation itself
-  // is already posted, and the link can be repaired by re-running this
-  // step. A future PR can move this into a single transaction with the
-  // journal entry creation.
-  if (journalEntryId) {
-    try {
-      const { data: matchedInboxItems } = await supabase
-        .from('invoice_inbox_items')
-        .select('id, document_id')
-        .eq('company_id', companyId)
-        .eq('matched_transaction_id', txId)
-        .is('created_journal_entry_id', null)
-      for (const inbox of (matchedInboxItems ?? []) as Array<{
-        id: string
-        document_id: string | null
-      }>) {
-        if (inbox.document_id) {
-          try {
-            await linkToJournalEntry(supabase, companyId, inbox.document_id, journalEntryId)
-          } catch (err) {
-            log.error('Failed to link inbox document to journal entry', {
-              inbox_item_id: inbox.id,
-              document_id: inbox.document_id,
-              journal_entry_id: journalEntryId,
-              error: err instanceof Error ? err.message : String(err),
-            })
-          }
-        }
-        const { error: stampError } = await supabase
-          .from('invoice_inbox_items')
-          .update({ created_journal_entry_id: journalEntryId })
-          .eq('id', inbox.id)
-          .eq('company_id', companyId)
-        if (stampError) {
-          log.error('Failed to stamp inbox item created_journal_entry_id', {
-            inbox_item_id: inbox.id,
-            journal_entry_id: journalEntryId,
-            error: stampError.message,
-          })
-        }
-      }
-    } catch (err) {
-      log.error('Failed to propagate underlag from matched inbox items', err)
-    }
-  }
-
-  try {
-    await upsertCounterpartyTemplate(
-      supabase, userId, transaction as Transaction, mappingResult, 'user_approved'
-    )
-  } catch { /* non-critical */ }
-
-  await eventBus.emit({
-    type: 'transaction.categorized',
-    payload: {
-      transaction: transaction as Transaction,
-      account: mappingResult.debit_account,
-      taxCode: mappingResult.vat_lines[0]?.account_number || '',
-      userId,
-      companyId,
-    },
+  // Booking, the duplicate guard, VAT mapping, and matched-inbox underlag
+  // propagation all live in the shared core (lib/transactions/categorize-core.ts)
+  // so the bulk-book-inbox executor and the Underlag "Bokför valda" route reuse
+  // exactly this logic.
+  return categorizeMatchedTransaction(supabase, userId, companyId, txId, {
+    category,
+    vatTreatment,
+    vatAmount,
+    notes,
+    allowDuplicate: params.allow_duplicate === true,
   })
-
-  return { data: { journal_entry_id: journalEntryId, category } }
 }
 
 async function commitCreateCustomer(
@@ -1016,6 +772,29 @@ async function commitMarkInvoicePaid(
   const invoiceAlreadyBooked = !!(invoice as { journal_entry_id?: string | null }).journal_entry_id
   const useCashEntry = !invoiceAlreadyBooked && accountingMethod === 'cash'
 
+  // Paid/remaining/status math + overpayment guard via the shared
+  // planInvoicePayment helper — the single source of truth across the three
+  // mark-paid surfaces (this agent path, the dashboard route, and the v1 API).
+  // This path settles the full remaining (no custom lines), so it can never
+  // overpay, but routing through the helper keeps the state identical. Runs
+  // BEFORE the JE below so a rejected payment never burns a voucher number.
+  // Settle the full outstanding balance. Prefer remaining_amount; for legacy rows
+  // where it was never written, derive it from total − paid_amount rather than
+  // falling back to the full total (which would double-count a prior partial
+  // payment and trip the overpayment guard).
+  const inv = invoice as { remaining_amount?: number | null; paid_amount?: number | null }
+  const paymentAmount = inv.remaining_amount ?? (invoice.total - (inv.paid_amount ?? 0))
+  const payment = planInvoicePayment(invoice, paymentAmount)
+  if (!payment.ok) {
+    return {
+      error:
+        getErrorEntry('MATCH_AMOUNT_EXCEEDS_REMAINING')?.message_sv ??
+        'Betalningsbeloppet är större än fakturans återstående belopp.',
+      status: 400,
+    }
+  }
+  const { newPaidAmount, newRemaining, newStatus } = payment.plan
+
   if (isRealInvoice) {
     if (useCashEntry) {
       const je = await createInvoiceCashEntry(
@@ -1028,18 +807,91 @@ async function commitMarkInvoicePaid(
       )
       journalEntryId = je?.id ?? null
     }
+
+    // Fail closed: a real invoice must produce a posted payment voucher.
+    // Marking it paid with no journal entry orphans the receivable and
+    // diverges the GL from the AR sub-ledger. Nothing was posted (the helper
+    // returned null), so there is no voucher to cancel.
+    if (!journalEntryId) {
+      return {
+        error:
+          'Betalningen kunde inte bokföras (ingen verifikation skapades — t.ex. stängd räkenskapsperiod). ' +
+          'Fakturan har inte markerats som betald.',
+        status: 422,
+      }
+    }
   }
 
   const now = new Date().toISOString()
-  const { error: updateError } = await supabase
+  // CAS guard: only flip from a payable status so a concurrently-settled
+  // invoice no-ops here instead of double-booking the payment.
+  const { data: updateResult, error: updateError } = await supabase
     .from('invoices')
-    .update({ status: 'paid', paid_at: now, paid_amount: invoice.total })
+    .update({
+      status: newStatus,
+      paid_amount: newPaidAmount,
+      remaining_amount: newRemaining,
+      ...(newStatus === 'paid' ? { paid_at: now } : {}),
+    })
     .eq('id', invoiceId)
     .eq('company_id', companyId)
+    .in('status', ['sent', 'overdue', 'partially_paid'])
+    .select('id')
 
-  if (updateError) return { error: 'Failed to update invoice status', status: 500 }
+  if (updateError) {
+    // The payment voucher already posted but the invoice row did not flip;
+    // cancel the orphan so the GL doesn't diverge from the sub-ledger.
+    if (journalEntryId) {
+      await cancelOrphanedPaymentEntry(
+        supabase, companyId, userId, journalEntryId,
+        'Automatiskt makulerad: fakturauppdatering misslyckades efter bokförd betalning',
+      )
+    }
+    return { error: 'Failed to update invoice status', status: 500 }
+  }
 
-  return { data: { status: 'paid', journal_entry_id: journalEntryId } }
+  if (!updateResult || updateResult.length === 0) {
+    // Race lost: the invoice was settled concurrently between our read and
+    // write. Cancel the orphaned payment voucher and document the gap rather
+    // than leaving a double booking.
+    if (journalEntryId) {
+      await cancelOrphanedPaymentEntry(
+        supabase, companyId, userId, journalEntryId,
+        'Automatiskt makulerad: dubblettbokning förhindrad av samtidighetsskydd',
+      )
+    }
+    return {
+      error: 'Invoice can only be marked as paid from a payable status (sent, overdue or partially paid)',
+      status: 409,
+    }
+  }
+
+  // Notify subscribers — invoice.paid fans out to registered webhooks
+  // (lib/webhooks/handler.ts). Best-effort: the payment is already committed,
+  // so an emit failure must not fail the operation. Parity with the v1 and
+  // dashboard mark-paid routes, which previously emitted while this path did not.
+  try {
+    await eventBus.emit({
+      type: 'invoice.paid',
+      payload: {
+        invoice: {
+          ...(invoice as Invoice),
+          status: newStatus,
+          paid_amount: newPaidAmount,
+          remaining_amount: newRemaining,
+          paid_at: newStatus === 'paid' ? now : (invoice as Invoice).paid_at,
+        } as Invoice,
+        companyId,
+        userId,
+        paymentAmount,
+        paymentDate,
+      },
+    })
+  } catch (err) {
+    log.warn('invoice.paid emit failed', err)
+  }
+
+  return { data: { status: newStatus, remaining_amount: newRemaining, journal_entry_id: journalEntryId } }
 }
 
 async function commitSendInvoice(
@@ -1756,6 +1608,73 @@ async function commitAttachDocumentToTransaction(
       previous_document_id: previousDocumentId,
       journal_entry_id: journalEntryId,
     },
+  }
+}
+
+async function commitLinkDocumentToVoucher(
+  supabase: SupabaseClient,
+  _userId: string,
+  companyId: string,
+  params: Record<string, unknown>
+): Promise<ExecutorResult> {
+  const documentId = params.document_id as string
+  const journalEntryId = params.journal_entry_id as string
+  const journalEntryLineId = params.journal_entry_line_id as string | undefined
+  if (!documentId || !journalEntryId) {
+    return { error: 'document_id and journal_entry_id are required', status: 400 }
+  }
+
+  const { data: doc, error: docError } = await supabase
+    .from('document_attachments')
+    .select('id, file_name, journal_entry_id')
+    .eq('id', documentId)
+    .eq('company_id', companyId)
+    .maybeSingle()
+  if (docError || !doc) return { error: 'Document not found', status: 404 }
+
+  // WORM guard: refuse to re-link a doc already linked to a DIFFERENT posted JE.
+  const existingJeId = (doc.journal_entry_id as string | null) ?? null
+  if (existingJeId && existingJeId !== journalEntryId) {
+    const { data: existingJe } = await supabase
+      .from('journal_entries')
+      .select('status')
+      .eq('id', existingJeId)
+      .eq('company_id', companyId)
+      .maybeSingle()
+    if (existingJe && (existingJe as { status: string }).status === 'posted') {
+      return {
+        error:
+          'Bilagan är kopplad till en bokförd verifikation och kan inte länkas om. Ladda upp ett nytt dokument.',
+        status: 409,
+      }
+    }
+  }
+
+  try {
+    const updated = await linkToJournalEntry(
+      supabase,
+      companyId,
+      documentId,
+      journalEntryId,
+      journalEntryLineId,
+    )
+    return {
+      data: {
+        document_id: updated.id,
+        file_name: updated.file_name,
+        journal_entry_id: updated.journal_entry_id,
+        journal_entry_line_id: updated.journal_entry_line_id ?? null,
+      },
+    }
+  } catch (err) {
+    const msg = (err as Error).message ?? ''
+    if (/locked\/closed fiscal period|Bokföringen är låst/i.test(msg)) {
+      return {
+        error: 'Verifikationens period är låst — bilagan kan inte länkas.',
+        status: 409,
+      }
+    }
+    return { error: `Failed to link document: ${msg}`, status: 500 }
   }
 }
 
@@ -3412,6 +3331,48 @@ async function commitBulkBookTransactions(
   return { data: result as unknown as Record<string, unknown>, status: 200 }
 }
 
+/**
+ * Bulk-book selected Underlag (Dokumentinkorgen) — Lena-driven flow. Each
+ * selected inbox item is booked against its matched bank transaction using one
+ * shared category + VAT treatment. The booking, VAT (incl. reverse charge), and
+ * underlag→verifikat propagation are the SAME shared core the single-item
+ * categorize path uses (categorizeMatchedTransaction). Items that can't be
+ * booked are skipped with a reason rather than failing the whole batch — the
+ * "Bokför valda hoppar över" contract. A per-item throw (e.g. period locked,
+ * accounts not in chart) is caught and recorded as a skip so one bad underlag
+ * never blocks the rest.
+ */
+async function commitBulkBookInboxItems(
+  supabase: SupabaseClient,
+  userId: string,
+  companyId: string,
+  params: Record<string, unknown>
+): Promise<ExecutorResult> {
+  const parsed = BulkBookInboxSchema.safeParse(params)
+  if (!parsed.success) {
+    return { error: `Invalid bulk_book_inbox_items params: ${parsed.error.message}`, status: 400 }
+  }
+
+  const { booked, skipped } = await bulkBookMatchedInboxItems(supabase, userId, companyId, parsed.data)
+
+  log.info('bulk_book_inbox_items committed', {
+    companyId,
+    operationType: 'bulk_book_inbox_items',
+    requested: parsed.data.item_ids.length,
+    bookedCount: booked.length,
+    skippedCount: skipped.length,
+  })
+
+  return {
+    data: {
+      booked_count: booked.length,
+      skipped_count: skipped.length,
+      booked,
+      skipped,
+    },
+  }
+}
+
 async function commitLinkTransactionJournalEntry(
   supabase: SupabaseClient,
   userId: string,
@@ -3501,6 +3462,23 @@ async function commitPendingOperationInner(
   pendingOp: PendingOperation,
   opts: CommitOptions = {}
 ): Promise<CommitResult> {
+  // ── Capability gate (commit-time twin of the MCP dispatch gate). The actual
+  //    external-service call (email / Skatteverket submit) happens below, so
+  //    this is the true paid chokepoint — it also catches an op STAGED during
+  //    the trial then approved AFTER the grant expired, regardless of caller
+  //    (MCP approve tool or the UI approval path). Checked BEFORE the atomic
+  //    claim so a blocked op stays 'pending' and is re-approvable once the
+  //    company subscribes. Self-hosted short-circuits to all-on in hasCapability.
+  const requiredCapability = PAID_OPERATION_CAPABILITY_MAP[pendingOp.operation_type]
+  if (requiredCapability && !(await hasCapability(supabase, companyId, requiredCapability))) {
+    return {
+      status: 'failed',
+      error: CAPABILITY_BLOCKED_MESSAGE_SV,
+      http_status: 403,
+      code: 'capability_blocked',
+    }
+  }
+
   // ── Atomic claim: flip status pending → committing in a single conditional
   //    update. If 0 rows are affected, another caller (auto-commit ↔ human
   //    approval, or two parallel approvals) already claimed this op and we
@@ -3584,6 +3562,9 @@ async function commitPendingOperationInner(
       case 'attach_document_to_transaction':
         result = await commitAttachDocumentToTransaction(supabase, userId, companyId, pendingOp.params)
         break
+      case 'link_document_to_voucher':
+        result = await commitLinkDocumentToVoucher(supabase, userId, companyId, pendingOp.params)
+        break
       case 'run_year_end':
         result = await commitRunYearEnd(supabase, userId, companyId, pendingOp.params)
         break
@@ -3640,6 +3621,9 @@ async function commitPendingOperationInner(
         break
       case 'bulk_book_transactions':
         result = await commitBulkBookTransactions(supabase, companyId, pendingOp.params)
+        break
+      case 'bulk_book_inbox_items':
+        result = await commitBulkBookInboxItems(supabase, userId, companyId, pendingOp.params)
         break
       case 'link_transaction_journal_entry':
         result = await commitLinkTransactionJournalEntry(supabase, userId, companyId, pendingOp.params)
@@ -3740,7 +3724,7 @@ async function commitPendingOperationInner(
   }
 
   const now = new Date().toISOString()
-  await supabase
+  const { error: finalizeError } = await supabase
     .from('pending_operations')
     .update({
       status: 'committed',
@@ -3748,6 +3732,20 @@ async function commitPendingOperationInner(
       result_data: result.data || {},
     })
     .eq('id', pendingOp.id)
+
+  if (finalizeError) {
+    // The executor's side-effects already committed (and are immutable); only
+    // the terminal status write failed. Without surfacing this, the row would
+    // sit in 'committing' indefinitely — the expire sweep only targets
+    // 'pending' ops, so nothing would ever reconcile it. Log loudly with the
+    // ids needed to finalize manually; the response still reports success
+    // because the actual work is done.
+    log.error('failed to finalize pending_operation to committed (left in committing)', finalizeError, {
+      pendingOperationId: pendingOp.id,
+      operationType: pendingOp.operation_type,
+      companyId,
+    })
+  }
 
   return {
     status: 'committed',
