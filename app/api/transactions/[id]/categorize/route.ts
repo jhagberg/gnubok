@@ -8,6 +8,7 @@ import { createTransactionJournalEntry } from '@/lib/bookkeeping/transaction-ent
 import { detectBookingDuplicate } from '@/lib/transactions/booking-duplicate-detection'
 import { appendProcessingHistory } from '@/lib/processing-history/append'
 import { saveUserMappingRule, applySettlementAccount } from '@/lib/bookkeeping/mapping-engine'
+import { resolveSettlementAccount } from '@/lib/bookkeeping/settlement-account'
 import { upsertCounterpartyTemplate, buildMappingResultFromCounterpartyTemplate } from '@/lib/bookkeeping/counterparty-templates'
 import { withRouteContext } from '@/lib/api/with-route-context'
 import { errorResponse, errorResponseFromCode } from '@/lib/errors/get-structured-error'
@@ -17,7 +18,7 @@ import {
   escapeLikePattern,
   normalizeOcrReference,
 } from '@/lib/invoices/duplicate-payment-guard'
-import { AccountsNotInChartError, accountsNotInChartResponse, isBookkeepingError } from '@/lib/bookkeeping/errors'
+import { AccountsNotInChartError, accountsNotInChartResponse } from '@/lib/bookkeeping/errors'
 import { collectMappingResultAccounts, findUnresolvableAccounts } from '@/lib/bookkeeping/account-validation'
 import { getErrorMessage } from '@/lib/errors/get-error-message'
 import type { Logger } from '@/lib/logger'
@@ -192,8 +193,7 @@ export const POST = withRouteContext(
           requestId,
           dismissedTransactionId: candidate.transaction_id,
         })
-        // Persist the dismissal to behandlingshistorik (BFNAR 2013:2 kap 8) —
-        // booking over a DETECTED possible double-booking is a bookkeeping
+        // Persist the dismissal to behandlingshistorik (BFNAR 2013:2 kap 8):         // booking over a DETECTED possible double-booking is a bookkeeping
         // decision that needs a durable record. Best-effort; never blocks the
         // booking.
         try {
@@ -313,28 +313,14 @@ export const POST = withRouteContext(
     // rather than the hardcoded 1930 in the templates. Without this, interest
     // or fees that landed on a savings/EUR account mis-book to 1930 and the
     // real bank line never reconciles. applySettlementAccount only rewrites a
-    // 1930 leg and is a no-op when the settlement account is 1930 — so legacy
+    // 1930 leg and is a no-op when the settlement account is 1930, so legacy
     // rows with no cash_account_id behave exactly as before.
-    let settlementAccount = '1930'
-    if (transaction.cash_account_id) {
-      const { data: txCashAccount, error: cashAccountError } = await supabase
-        .from('cash_accounts')
-        .select('ledger_account')
-        .eq('id', transaction.cash_account_id)
-        .eq('company_id', companyId)
-        .maybeSingle()
-      if (cashAccountError) {
-        // Don't fail the booking — fall back to 1930 — but surface the lookup
-        // failure so a silent mis-booking to the wrong bank leg stays auditable.
-        txLog.warn('settlement-account lookup failed; defaulting to 1930', {
-          cashAccountId: transaction.cash_account_id,
-          error: cashAccountError.message,
-        })
-      }
-      if (txCashAccount?.ledger_account) {
-        settlementAccount = txCashAccount.ledger_account as string
-      }
-    }
+    const settlementAccount = await resolveSettlementAccount(
+      supabase,
+      companyId!,
+      transaction.cash_account_id,
+      txLog,
+    )
     mappingResult = applySettlementAccount(mappingResult, settlementAccount)
 
     txLog.info('mapping resolved', {
@@ -421,7 +407,7 @@ export const POST = withRouteContext(
     // an open supplier invoice already covers this amount. Categorizing direct
     // to 244x leaves the invoice with status='approved' and lures the user
     // into a duplicate "Markera som betald" later. Credit must be a bank/cash
-    // account (1xxx) — 244x against a clearing account, equity, etc. isn't a
+    // account (1xxx): 244x against a clearing account, equity, etc. isn't a
     // supplier payment and the suggestion would misdirect the user.
     if (
       !body.confirm_no_match &&
@@ -492,7 +478,7 @@ export const POST = withRouteContext(
     // Prong B (customer side): intercept plain 151x categorization of an
     // inbound payment when an unpaid customer invoice already covers this
     // amount. Symmetric with the supplier-side intercept above. The debit
-    // must be a bank/cash account (^19\d{2}$, BAS class 19) — a 1xxx debit
+    // must be a bank/cash account (^19\d{2}$, BAS class 19): a 1xxx debit
     // outside class 19 isn't a payment receipt and the suggestion would
     // misdirect the user.
     if (
@@ -528,7 +514,7 @@ export const POST = withRouteContext(
 
       // Date window anchored on `due_date`, NOT `invoice_date`. Customer
       // payments arrive close to (or after) the due date; for an invoice
-      // with 60–90 day terms, anchoring on invoice_date would push the
+      // with 60-90 day terms, anchoring on invoice_date would push the
       // expected payment outside a ±60-day window and the guard would miss
       // genuine matches. due_date is the better proxy for "around when the
       // payment is expected."
@@ -647,24 +633,23 @@ export const POST = withRouteContext(
       txLog.error('failed to create transaction journal entry', err as Error)
       // AccountsNotInChartError means an account was deactivated between our
       // pre-validation and the engine call (rare race). Don't fall through to
-      // the partial-success path — that would mark the transaction bokförd
+      // the partial-success path: that would mark the transaction bokförd
       // with no verifikation and leave the user staring at an unclosable
       // dialog. Return a structured 400 so the row stays in "Att bokföra"
       // and the user can re-activate the account and retry.
       if (err instanceof AccountsNotInChartError) {
         return accountsNotInChartResponse(err)
       }
-      // Bookkeeping errors map to Swedish via the registry. Other errors get
-      // their raw message — the categorization is preserved either way so the
-      // user can still re-book the verifikation manually.
-      if (isBookkeepingError(err)) {
-        journalEntryError = getErrorMessage(err, { context: 'transaction' })
-      } else {
-        journalEntryError = err instanceof Error ? err.message : 'Unknown error'
-      }
+      // All errors map to Swedish via getErrorMessage: the raw message is
+      // already logged above and must never reach the user verbatim (issue
+      // #337). The categorization is preserved either way so the user can
+      // still re-book the verifikation manually.
+      journalEntryError = getErrorMessage(err, { context: 'transaction' })
     }
 
-    if (is_business && transaction.merchant_name) {
+    // direction_mismatch = a mirrored refund/repayment booking; learning it
+    // as a rule would store backwards accounts for the merchant.
+    if (is_business && transaction.merchant_name && !mappingResult.direction_mismatch) {
       try {
         await saveUserMappingRule(
           supabase,
@@ -682,8 +667,10 @@ export const POST = withRouteContext(
     }
 
     try {
+      // Templates are company-scoped since the multi-tenant refactor: passing
+      // user.id here broke learning entirely (FK/RLS reject the write).
       await upsertCounterpartyTemplate(
-        supabase, user.id, transaction as Transaction, mappingResult, 'user_approved',
+        supabase, companyId, transaction as Transaction, mappingResult, 'user_approved',
       )
     } catch (err) {
       txLog.warn('failed to upsert counterparty template (non-critical)', err as Error)
@@ -713,7 +700,7 @@ export const POST = withRouteContext(
       // receipt-on-verifikation (BFL 5 kap 6 §) is satisfied. The journal entry has
       // already been committed at this point, so we can't roll it back; instead
       // surface a warning in the response so the UI can prompt the user to retry
-      // the link. Supabase JS returns { error } rather than throwing — destructure
+      // the link. Supabase JS returns { error } rather than throwing: destructure
       // and surface it, never swallow silently.
       try {
         const { error: linkErr } = await supabase
@@ -758,7 +745,7 @@ export const POST = withRouteContext(
         // unmatched. Categorizing here puts the underlag on a verifikation,
         // which is the inbox's "booked" state. Without this the inbox keeps
         // offering "Matcha mot transaktion" for an underlag that's already on a
-        // posted entry — while the transactions view (which reads the
+        // posted entry, while the transactions view (which reads the
         // doc↔verifikat link) already shows it as attached. Mirrors the
         // backfill that /attach-document does for the manual paperclip path.
         await supabase
@@ -821,7 +808,7 @@ export const POST = withRouteContext(
     // Flag any inbox underlag already matched to this transaction as booked.
     // The block above only fires when the caller passes an explicit
     // inbox_item_id (booking straight from the inbox flow). Booking the same
-    // transaction from anywhere else — the /transactions list, quick review —
+    // transaction from anywhere else (the /transactions list, quick review)
     // would otherwise leave an attached underlag stuck as "Kopplad" in the
     // inbox forever. Here we resolve it by the link itself (matched_transaction
     // _id) so the inbox reflects the booking regardless of entry point. Mirrors
@@ -871,7 +858,7 @@ export const POST = withRouteContext(
 
     if (journalEntryError) {
       // Categorization stuck but the verifikation didn't make it through.
-      // Surface as a structured warning — the response below carries the
+      // Surface as a structured warning: the response below carries the
       // user-facing message in `journal_entry_error`.
       txLog.warn('partial outcome: journal entry creation failed', {
         reason: 'journal_entry_creation_failed',

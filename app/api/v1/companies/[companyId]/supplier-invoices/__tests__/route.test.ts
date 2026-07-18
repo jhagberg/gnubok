@@ -3,7 +3,7 @@
  *
  * Coverage: list, get, create (incl. period-lock + strict-mode), patch,
  * approve, mark-paid, credit. Same Proxy-mock pattern as the suppliers
- * tests — we test outcomes, not query shape.
+ * tests: we test outcomes, not query shape.
  */
 
 import { beforeAll, beforeEach, describe, expect, it, vi } from 'vitest'
@@ -44,7 +44,7 @@ vi.mock('@/lib/bookkeeping/supplier-invoice-entries', () => ({
   createSupplierCreditNoteEntry: (...args: unknown[]) => mockedCredit(...args),
 }))
 
-// reverseEntry is dynamically imported in the route file for orphan storno —
+// reverseEntry is dynamically imported in the route file for orphan storno:
 // stub it so the import resolves quickly without exercising the real engine.
 vi.mock('@/lib/bookkeeping/engine', async () => {
   const actual = await vi.importActual<typeof import('@/lib/bookkeeping/engine')>(
@@ -436,8 +436,12 @@ describe('POST /api/v1/companies/:companyId/supplier-invoices', () => {
     expect(res.status).toBe(400)
     const body = await res.json()
     expect(body.error.code).toBe('VALIDATION_ERROR')
-    expect(body.error.details.attempted_rate).toBe(0.15)
-    expect(body.error.details.allowed_rates).toEqual([0, 0.06, 0.12, 0.25])
+    // Since issue #310 the shared Zod schema rejects non-statutory rates
+    // before the runtime ALLOWED_SV_VAT_RATES guard (kept as defense in
+    // depth), so the details carry Zod issues instead of attempted_rate.
+    const issues = body.error.details.issues as Array<{ field: string; message: string }>
+    expect(issues.some((i) => i.field === 'items.0.vat_rate')).toBe(true)
+    expect(issues.find((i) => i.field === 'items.0.vat_rate')!.message).toMatch(/decimal fraction/)
   })
 
   it('defaults vat_treatment to reverse_charge for eu_business suppliers', async () => {
@@ -500,7 +504,7 @@ describe('POST /api/v1/companies/:companyId/supplier-invoices', () => {
     const res = await createSI(
       makeRequest(`https://x.test/api/v1/companies/${COMPANY_ID}/supplier-invoices`, {
         method: 'POST',
-        // No vat_treatment, no reverse_charge — supplier_type should drive
+        // No vat_treatment, no reverse_charge: supplier_type should drive
         // both. vat_rate: 0 because reverse-charge invoices must carry no
         // line-item VAT (buyer self-assesses).
         body: JSON.stringify({
@@ -535,7 +539,7 @@ describe('POST /api/v1/companies/:companyId/supplier-invoices', () => {
         body: JSON.stringify({
           ...validBody,
           reverse_charge: true,
-          // item vat_rate still 0.25 — must be 0 under reverse charge
+          // item vat_rate still 0.25: must be 0 under reverse charge
         }),
       }),
       companyParams(COMPANY_ID),
@@ -628,6 +632,146 @@ describe('POST /api/v1/companies/:companyId/supplier-invoices', () => {
     expect(insertedRow!.vat_treatment).toBe('reverse_charge')
     expect(insertedRow!.reverse_charge).toBe(true)
   })
+
+  it('persists default_dimensions + items[].dimensions and hands the item bags to the JE engine', async () => {
+    let insertedInvoice: Record<string, unknown> | null = null
+    let insertedItems: Array<Record<string, unknown>> | null = null
+    mockServiceClient.mockReturnValue({
+      from: (table: string) => {
+        if (table === 'supplier_invoices') {
+          return new Proxy({}, {
+            get(_t, prop) {
+              if (prop === 'insert') {
+                return (row: Record<string, unknown>) => {
+                  insertedInvoice = row
+                  return new Proxy({}, {
+                    get(_t2, prop2) {
+                      if (prop2 === 'then') {
+                        return (r: (v: unknown) => void) => r({ data: SAMPLE_SI, error: null })
+                      }
+                      return () => new Proxy({}, this!)
+                    },
+                  })
+                }
+              }
+              if (prop === 'then') {
+                return (r: (v: unknown) => void) => r({ data: SAMPLE_SI, error: null })
+              }
+              return () => new Proxy({}, this!)
+            },
+          })
+        }
+        if (table === 'supplier_invoice_items') {
+          return new Proxy({}, {
+            get(_t, prop) {
+              if (prop === 'insert') {
+                return (rows: Array<Record<string, unknown>>) => {
+                  insertedItems = rows
+                  return new Proxy({}, {
+                    get(_t2, prop2) {
+                      if (prop2 === 'then') {
+                        return (r: (v: unknown) => void) => r({ data: null, error: null })
+                      }
+                      return () => new Proxy({}, this!)
+                    },
+                  })
+                }
+              }
+              if (prop === 'then') {
+                return (r: (v: unknown) => void) => r({ data: null, error: null })
+              }
+              return () => new Proxy({}, this!)
+            },
+          })
+        }
+        return new Proxy({}, {
+          get(_t, prop) {
+            if (prop === 'then') {
+              const data = table === 'company_members'
+                ? { company_id: COMPANY_ID, role: 'owner' }
+                : table === 'suppliers'
+                  ? SAMPLE_SUPPLIER
+                  : table === 'fiscal_periods'
+                    ? { id: 'fp-1', is_closed: false, locked_at: null }
+                    : table === 'company_settings'
+                      ? { bookkeeping_locked_through: null, accounting_method: 'accrual' }
+                      : null
+              return (r: (v: unknown) => void) => r({ data, error: null })
+            }
+            return () => new Proxy({}, this!)
+          },
+        })
+      },
+      rpc: vi.fn(() => Promise.resolve({ data: 42, error: null })),
+    })
+
+    const res = await createSI(
+      makeRequest(`https://x.test/api/v1/companies/${COMPANY_ID}/supplier-invoices`, {
+        method: 'POST',
+        body: JSON.stringify({
+          ...validBody,
+          default_dimensions: { '6': 'P001' },
+          items: [
+            {
+              description: 'Office supplies',
+              amount: 1000,
+              account_number: '5410',
+              vat_rate: 0.25,
+              dimensions: { '1': 'KS01' },
+            },
+          ],
+        }),
+      }),
+      companyParams(COMPANY_ID),
+    )
+
+    expect(res.status).toBe(201)
+    expect(insertedInvoice).not.toBeNull()
+    expect(insertedInvoice!.default_dimensions).toEqual({ '6': 'P001' })
+    expect(insertedItems).not.toBeNull()
+    expect(insertedItems![0].dimensions).toEqual({ '1': 'KS01' })
+    // The engine receives the item rows WITH their bags so the registration
+    // JE expense lines are tagged (bag merge happens inside the generator).
+    expect(mockedReg).toHaveBeenCalledTimes(1)
+    const engineItems = mockedReg.mock.calls[0][4] as Array<{ dimensions?: Record<string, string> }>
+    expect(engineItems[0].dimensions).toEqual({ '1': 'KS01' })
+  })
+
+  it('dry-run preview carries default_dimensions and per-item dimensions', async () => {
+    mockServiceClient.mockReturnValue(
+      makeFlexibleSupabase({
+        company_members: { data: { company_id: COMPANY_ID, role: 'owner' }, error: null },
+        suppliers: { data: SAMPLE_SUPPLIER, error: null },
+        company_settings: { data: { bookkeeping_locked_through: null }, error: null },
+        fiscal_periods: { data: { id: 'fp-1', is_closed: false, locked_at: null }, error: null },
+        idempotency_keys: { data: null, error: null },
+      }),
+    )
+    const res = await createSI(
+      makeRequest(`https://x.test/api/v1/companies/${COMPANY_ID}/supplier-invoices?dry_run=true`, {
+        method: 'POST',
+        body: JSON.stringify({
+          ...validBody,
+          default_dimensions: { '6': 'P001' },
+          items: [
+            {
+              description: 'Office supplies',
+              amount: 1000,
+              account_number: '5410',
+              vat_rate: 0.25,
+              dimensions: { '1': 'KS01' },
+            },
+          ],
+        }),
+      }),
+      companyParams(COMPANY_ID),
+    )
+    expect(res.status).toBe(200)
+    expect(res.headers.get('X-Dry-Run')).toBe('true')
+    const body = await res.json()
+    expect(body.data.preview.default_dimensions).toEqual({ '6': 'P001' })
+    expect(body.data.preview.items[0].dimensions).toEqual({ '1': 'KS01' })
+  })
 })
 
 describe('PATCH /api/v1/companies/:companyId/supplier-invoices/:id', () => {
@@ -683,7 +827,7 @@ describe('PATCH /api/v1/companies/:companyId/supplier-invoices/:id', () => {
     const res = await updateSI(
       makeRequest(`https://x.test/api/v1/companies/${COMPANY_ID}/supplier-invoices/${SI_ID}`, {
         method: 'PATCH',
-        // `status` is not in UpdateSupplierInvoiceSchema — must be rejected.
+        // `status` is not in UpdateSupplierInvoiceSchema: must be rejected.
         body: JSON.stringify({ status: 'approved' }),
       }),
       detailParams(COMPANY_ID, SI_ID),
@@ -787,7 +931,7 @@ describe('POST /api/v1/companies/:companyId/supplier-invoices/:id/mark-paid', ()
 
     // For the update path, simulate the .update().select().maybeSingle()
     // returning the new row. The flexible mock returns the same response per
-    // table, so set the supplier_invoices response to the updated row — both
+    // table, so set the supplier_invoices response to the updated row: both
     // the pre-flight read AND the update read will return it. We only check
     // the response shape from the latter, which the route maps directly.
     mockServiceClient.mockReturnValue(
@@ -934,7 +1078,7 @@ describe('POST /api/v1/companies/:companyId/supplier-invoices/:id/mark-paid', ()
     mockServiceClient.mockReturnValue(
       makeFlexibleSupabase({
         company_members: { data: { company_id: COMPANY_ID, role: 'owner' }, error: null },
-        // The pre-flight fetch should not even fire — the schema check runs first.
+        // The pre-flight fetch should not even fire: the schema check runs first.
         supplier_invoices: { data: approvedSI, error: null },
         idempotency_keys: { data: null, error: null },
       }),
@@ -969,7 +1113,7 @@ describe('POST /api/v1/companies/:companyId/supplier-invoices/:id/mark-paid', ()
     const res = await markPaidSI(
       makeRequest(`https://x.test/api/v1/companies/${COMPANY_ID}/supplier-invoices/${SI_ID}/mark-paid`, {
         method: 'POST',
-        // 1500 > 1250 remaining — must be rejected, not silently clamped.
+        // 1500 > 1250 remaining: must be rejected, not silently clamped.
         body: JSON.stringify({ amount: 1500 }),
       }),
       detailParams(COMPANY_ID, SI_ID),

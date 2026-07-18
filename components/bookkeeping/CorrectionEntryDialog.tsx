@@ -1,7 +1,8 @@
 'use client'
 
-import { useState, useEffect } from 'react'
+import { useState, useEffect, useMemo } from 'react'
 import { useRouter } from 'next/navigation'
+import { useTranslations } from 'next-intl'
 import {
   Dialog,
   DialogContent,
@@ -11,13 +12,24 @@ import {
 } from '@/components/ui/dialog'
 import { Button } from '@/components/ui/button'
 import { Input } from '@/components/ui/input'
+import { Label } from '@/components/ui/label'
 import AccountCombobox from '@/components/bookkeeping/AccountCombobox'
 import CorrectionPreview from '@/components/bookkeeping/CorrectionPreview'
+import {
+  autoCorrectionDescription,
+  correctionDescriptionForSubmit,
+} from '@/components/bookkeeping/correction-entry-description'
+import { nextLineDescriptionForAccountChange } from '@/components/bookkeeping/correction-line-description'
 import { useToast } from '@/components/ui/use-toast'
 import { getErrorMessage } from '@/lib/errors/get-error-message'
-import { Plus, Trash2 } from 'lucide-react'
+import { Loader2, Plus, Trash2 } from 'lucide-react'
 import { formatDate } from '@/lib/utils'
 import { formatVoucher } from '@/lib/bookkeeping/voucher-series-resolver'
+import {
+  changeCorrectionLineAccount,
+  getSelectableCorrectionCatalog,
+} from '@/lib/bookkeeping/correction-line-account'
+import { loadBasCatalog, type CatalogAccount } from '@/lib/bookkeeping/bas-catalog-client'
 import type { JournalEntry, JournalEntryLine, BASAccount } from '@/types'
 
 interface CorrectionLine {
@@ -37,9 +49,26 @@ interface Props {
 export default function CorrectionEntryDialog({ entry, open, onOpenChange, onCorrected }: Props) {
   const { toast } = useToast()
   const router = useRouter()
+  const t = useTranslations('journal_detail')
   const [accounts, setAccounts] = useState<BASAccount[]>([])
+  const [catalog, setCatalog] = useState<CatalogAccount[]>([])
+  const [accountsStatus, setAccountsStatus] = useState<'loading' | 'ready' | 'error'>('loading')
   const [lines, setLines] = useState<CorrectionLine[]>([])
+  const [description, setDescription] = useState('')
   const [isSubmitting, setIsSubmitting] = useState(false)
+
+  const activeAccounts = useMemo(
+    () => accounts.filter((account) => account.is_active),
+    [accounts],
+  )
+  const selectableCatalog = useMemo(
+    () => getSelectableCorrectionCatalog(accounts, catalog),
+    [accounts, catalog],
+  )
+  const accountNameSources = useMemo(
+    () => [...accounts, ...catalog],
+    [accounts, catalog],
+  )
 
   const originalLines = ((entry.lines || []) as JournalEntryLine[])
     .slice()
@@ -56,22 +85,60 @@ export default function CorrectionEntryDialog({ entry, open, onOpenChange, onCor
           line_description: l.line_description || '',
         }))
       )
-      fetchAccounts()
+      // Pre-fill the verifikationstext with the same auto text the server
+      // would generate; only a user edit is sent along (see handleSubmit).
+      setDescription(autoCorrectionDescription(entry.description))
+      void fetchAccounts()
     }
   }, [open, entry.id]) // eslint-disable-line react-hooks/exhaustive-deps
 
   async function fetchAccounts() {
+    setAccountsStatus('loading')
     try {
-      const res = await fetch('/api/bookkeeping/accounts')
+      const [res, basCatalog] = await Promise.all([
+        fetch('/api/bookkeeping/accounts?active=false'),
+        loadBasCatalog(),
+      ])
+      if (!res.ok) throw new Error(`accounts ${res.status}`)
       const { data } = await res.json()
       setAccounts(data || [])
+      setCatalog(basCatalog)
+      setAccountsStatus('ready')
     } catch {
-      // Accounts will be empty — user can still type account numbers manually
+      setAccounts([])
+      setCatalog([])
+      setAccountsStatus('error')
     }
   }
 
   const updateLine = (index: number, field: keyof CorrectionLine, value: string) => {
-    setLines((prev) => prev.map((l, i) => (i === index ? { ...l, [field]: value } : l)))
+    setLines((prev) =>
+      prev.map((l, i) => {
+        if (i !== index) return l
+        const next = { ...l, [field]: value }
+        // When the account changes, refresh the auto-filled description to the
+        // new account's name. Without this, a description carried over from the
+        // original entry (e.g. 2393 "Lån från närstående personer, långfristig
+        // del") stays stale on the newly chosen account (e.g. 2893, kortfristig).
+        if (field === 'account_number' && value) {
+          next.line_description = nextLineDescriptionForAccountChange(
+            l.line_description,
+            l.account_number,
+            value,
+            accounts,
+          )
+        }
+        return next
+      })
+    )
+  }
+
+  const updateLineAccount = (index: number, accountNumber: string) => {
+    setLines((prev) => prev.map((line, lineIndex) => (
+      lineIndex === index
+        ? changeCorrectionLineAccount(line, accountNumber, accountNameSources)
+        : line
+    )))
   }
 
   const addLine = () => {
@@ -105,7 +172,12 @@ export default function CorrectionEntryDialog({ entry, open, onOpenChange, onCor
       const res = await fetch(`/api/bookkeeping/journal-entries/${entry.id}/correct`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ lines: apiLines }),
+        body: JSON.stringify({
+          lines: apiLines,
+          // Only sent when the user changed the auto prefill: the server
+          // fallback ("Rättelse: <original>") stays the source of truth.
+          description: correctionDescriptionForSubmit(description, entry.description),
+        }),
       })
 
       const result = await res.json()
@@ -158,11 +230,11 @@ export default function CorrectionEntryDialog({ entry, open, onOpenChange, onCor
             <li>En ny verifikation med dina rättade uppgifter</li>
           </ol>
           <p className="mt-2">
-            Rättelsen bokförs i samma räkenskapsperiod som originalet — du hittar den under originalets räkenskapsår.
+            Rättelsen bokförs i samma räkenskapsperiod som originalet: du hittar den under originalets räkenskapsår.
           </p>
         </div>
 
-        {/* Original entry metadata — lines live inside CorrectionPreview below */}
+        {/* Original entry metadata: lines live inside CorrectionPreview below */}
         <div className="space-y-1">
           <div className="flex items-center gap-2 text-sm text-muted-foreground flex-wrap">
             <span className="text-muted-foreground">Original</span>
@@ -175,16 +247,47 @@ export default function CorrectionEntryDialog({ entry, open, onOpenChange, onCor
         {/* Live diff: original | storno | correction | förändring */}
         <CorrectionPreview originalLines={originalLines} correctedLines={lines} />
 
+        {/* Verifikationstext for the new (corrected) entry. Pre-filled with
+            the auto text; editable so a header named after the wrong account
+            is not echoed on the correction (issue #1031). */}
+        <div className="space-y-1">
+          <Label htmlFor="correction-description">Verifikationstext</Label>
+          <Input
+            id="correction-description"
+            value={description}
+            onChange={(e) => setDescription(e.target.value)}
+            placeholder={autoCorrectionDescription(entry.description)}
+          />
+          <p className="text-xs text-muted-foreground">
+            Texten på den nya verifikationen. Ändra den om originalets beskrivning inte längre
+            stämmer, till exempel när rättelsen byter konto.
+          </p>
+        </div>
+
         {/* Corrected lines (editable) */}
         <div className="space-y-2">
           <div className="space-y-1">
             <p className="text-sm font-medium">Rättade rader</p>
             <p className="text-xs text-muted-foreground">
-              Det här är hela den nya verifikationen — alla konton som ska finnas kvar måste stå
+              Det här är hela den nya verifikationen: alla konton som ska finnas kvar måste stå
               kvar. Tar du bort ett konto nollställs det (stornon återför det). Vill du bara återföra
               hela verifikatet utan att ersätta det, använd Återför (storno) istället.
             </p>
           </div>
+
+          {accountsStatus !== 'ready' && (
+            <div className="flex items-center justify-between gap-3 rounded-lg border bg-muted/50 p-3 text-sm text-muted-foreground">
+              <span className="flex items-center gap-2">
+                {accountsStatus === 'loading' && <Loader2 className="h-4 w-4 animate-spin" />}
+                {accountsStatus === 'loading' ? t('accounts_loading') : t('accounts_load_failed')}
+              </span>
+              {accountsStatus === 'error' && (
+                <Button variant="outline" size="sm" onClick={() => void fetchAccounts()}>
+                  {t('accounts_retry')}
+                </Button>
+              )}
+            </div>
+          )}
 
           <div className="space-y-2">
             {lines.map((line, index) => (
@@ -192,8 +295,10 @@ export default function CorrectionEntryDialog({ entry, open, onOpenChange, onCor
                 <div className="grid grid-cols-[1fr_auto] sm:contents gap-2">
                   <AccountCombobox
                     value={line.account_number}
-                    accounts={accounts}
-                    onChange={(v) => updateLine(index, 'account_number', v)}
+                    accounts={activeAccounts}
+                    catalog={selectableCatalog}
+                    onChange={(v) => updateLineAccount(index, v)}
+                    disabled={accountsStatus !== 'ready'}
                   />
                   <Button
                     variant="ghost"

@@ -6,7 +6,6 @@ import { createLogger } from '@/lib/logger'
 
 const log = createLogger('year-end-service')
 import { generateTrialBalance } from '@/lib/reports/trial-balance'
-import { generateIncomeStatement } from '@/lib/reports/income-statement'
 import { lockPeriod, closePeriod, createNextPeriod, findNextPeriod } from './period-service'
 import { generateResultAppropriation } from './result-appropriation-service'
 import {
@@ -116,7 +115,7 @@ export async function validateYearEndReadiness(
     }
   }
 
-  // Check gap explanations — unexplained gaps block year-end (BFNAR 2013:2 punkt 5.8)
+  // Check gap explanations: unexplained gaps block year-end (BFNAR 2013:2 punkt 5.8)
   let unexplainedGaps: VoucherGap[] = []
   if (voucherGaps.length > 0) {
     const { data: explanations } = await supabase
@@ -136,7 +135,7 @@ export async function validateYearEndReadiness(
       const key = `${gap.series}:${gap.gap_start}:${gap.gap_end}`
       if (explanationSet.has(key)) {
         warnings.push(
-          `Voucher gap in series ${gap.series} (${gap.gap_start}-${gap.gap_end}) — documented`
+          `Voucher gap in series ${gap.series} (${gap.gap_start}-${gap.gap_end}): documented`
         )
       } else {
         unexplainedGaps.push(gap)
@@ -251,15 +250,15 @@ export async function validateYearEndReadiness(
 
   // Check: continuity_verified flag from prior year-end
   if (period.continuity_verified === false) {
-    errors.push('Opening balance continuity check failed for this period — resolve discrepancies before closing')
+    errors.push('Opening balance continuity check failed for this period: resolve discrepancies before closing')
   }
 
   // Check: next period state. A pre-existing next period (from SIE import,
-  // manual creation, or a prior partial run) is fine — we'll reuse it — but
+  // manual creation, or a prior partial run) is fine (we'll reuse it), but
   // one with opening balances already booked blocks closing because we
   // can't post a second IB on top.
   //
-  // The period name is not interpolated into the message — although the
+  // The period name is not interpolated into the message: although the
   // name is user-supplied at create time and confined to the company,
   // surfacing DB-sourced strings through error paths is the kind of
   // injection footgun we'd rather close at the source than rely on the UI
@@ -269,7 +268,7 @@ export async function validateYearEndReadiness(
     if (nextPeriod.opening_balance_entry_id) {
       errors.push('Next fiscal period already has opening balances posted')
     } else {
-      warnings.push('Next fiscal period already exists — opening balances will be booked into it')
+      warnings.push('Next fiscal period already exists: opening balances will be booked into it')
     }
   }
 
@@ -309,10 +308,6 @@ export async function previewYearEndClosing(
     entityType === 'enskild_firma'
       ? 'Eget kapital'
       : 'Årets resultat'
-
-  // Get income statement for net result
-  const incomeStatement = await generateIncomeStatement(supabase, companyId, fiscalPeriodId)
-  const netResult = incomeStatement.net_result
 
   // Get trial balance for individual account balances in class 3-8
   const { rows } = await generateTrialBalance(supabase, companyId, fiscalPeriodId)
@@ -361,6 +356,16 @@ export async function previewYearEndClosing(
   // If negative (loss): debit to equity (2099/2010)
   const totalClosingDebit = closingLines.reduce((sum, l) => sum + l.debit_amount, 0)
   const totalClosingCredit = closingLines.reduce((sum, l) => sum + l.credit_amount, 0)
+
+  // netResult must equal, by construction, the signed amount transferred to the
+  // closing account (2099/2010) by the balancing line below: positive = credit
+  // = vinst, negative = debit = forlust. It is deliberately NOT taken from
+  // generateIncomeStatement: that report excludes source_type='year_end'
+  // entries, and bokslut-flow entries (annual depreciation, dispositioner)
+  // carry that tag, so the income-statement figure misses them and the
+  // summary card would mismatch the bokslutsverifikation table (issue #766).
+  const netResult = roundOre(totalClosingDebit - totalClosingCredit)
+
   const balancingAmount = roundOre(Math.abs(totalClosingDebit - totalClosingCredit))
 
   if (balancingAmount > ORE_TOLERANCE) {
@@ -423,7 +428,7 @@ export async function previewYearEndClosing(
  * 5. Set closing_entry_id on the period
  * 6. Resolve next fiscal period (reuse existing or create new)
  * 7. Lock the period
- * 8. Close the period (irreversible — every guard must run before this)
+ * 8. Close the period (irreversible, every guard must run before this)
  * 9. Generate opening balances in next period
  * 10. Validate IB/UB continuity
  * 11. Omföra föregående års resultat (2099 → 2098) in the new period (AB only)
@@ -467,11 +472,11 @@ export async function executeYearEndClosing(
   const preview = await previewYearEndClosing(supabase, companyId, userId, fiscalPeriodId)
 
   if (preview.closingLines.length === 0) {
-    throw new Error('No result accounts to close — period has no activity')
+    throw new Error('No result accounts to close: period has no activity')
   }
 
   // 3a. INVARIANT: closing entry must balance to the öre before commit.
-  // This guards against rounding drift in previewYearEndClosing — the DB
+  // This guards against rounding drift in previewYearEndClosing: the DB
   // balance trigger would catch it too, but we want a clear Swedish error
   // surfaced to the user, not a generic Postgres exception.
   const preCommitDebit = roundOre(
@@ -497,7 +502,7 @@ export async function executeYearEndClosing(
   })
 
   // 4a. INVARIANT: after the closing entry, class 3-8 net must be exactly 0
-  // (to the öre). If not, we have a logic bug — fail loud rather than
+  // (to the öre). If not, we have a logic bug: fail loud rather than
   // proceed into IB generation with a corrupt trial balance.
   // createJournalEntry has no transactional grouping with the next call;
   // the engine commits atomically per-entry via commit_journal_entry RPC,
@@ -541,7 +546,7 @@ export async function executeYearEndClosing(
   //    period between validateYearEndReadiness and step 8 (TOCTOU race).
   //
   //    The thrown error is intentionally a stable English string with no
-  //    DB-sourced data interpolated — the route layer maps it to a
+  //    DB-sourced data interpolated: the route layer maps it to a
   //    structured error code, and the next period name (if any) is surfaced
   //    only through the structured details payload after explicit checks.
   const existingNextPeriod = await findNextPeriod(supabase, companyId, fiscalPeriodId)
@@ -560,7 +565,7 @@ export async function executeYearEndClosing(
   // 7. Lock the period
   await lockPeriod(supabase, companyId, userId, fiscalPeriodId)
 
-  // 8. Close the period — irreversible per BFL. Every guard that can fail
+  // 8. Close the period: irreversible per BFL. Every guard that can fail
   //    on prior state must run before this point.
   await closePeriod(supabase, companyId, userId, fiscalPeriodId)
 
@@ -581,10 +586,10 @@ export async function executeYearEndClosing(
   // Note on atomicity: createJournalEntry uses an atomic commit_journal_entry
   // RPC per entry, but the closing + IB entries are two separate commits with
   // a period lock/close in between. Once committed, posted entries are
-  // immutable by DB trigger — true rollback isn't possible. reverseEntry()
+  // immutable by DB trigger: true rollback isn't possible. reverseEntry()
   // posts a compensating storno entry instead. The closed period was also
-  // locked & closed, but reverseEntry uses an entry_date that — under the
-  // period-lock trigger — may be blocked. We attempt reversal but tolerate
+  // locked & closed, but reverseEntry uses an entry_date that (under the
+  // period-lock trigger) may be blocked. We attempt reversal but tolerate
   // failure, surfacing the original continuity error either way.
   const continuity = await validateBalanceContinuity(supabase, companyId, nextPeriod.id)
 
@@ -614,7 +619,7 @@ export async function executeYearEndClosing(
 
   // 11. Omföra föregående års resultat: move 2099 "Årets resultat" off onto
   //     2098 in the new period so it starts the year at zero (aktiebolag only).
-  //     This is a SEPARATE verifikat by design — folding it into the IB entry
+  //     This is a SEPARATE verifikat by design: folding it into the IB entry
   //     would make the continuity check above fail, since that check reads IB
   //     solely from the opening_balance entry. Non-fatal: the close and IB are
   //     already valid and immutable; a failure here is logged and left for the
@@ -631,7 +636,7 @@ export async function executeYearEndClosing(
   } catch (err) {
     resultAppropriationFailed = true
     // alert:true marks this for out-of-band alerting (the log sink / Sentry
-    // integration filters on it) — a silent accounting failure must not wait
+    // integration filters on it): a silent accounting failure must not wait
     // for a manual audit. The new period now opens with 2099 still carrying the
     // prior result; resultAppropriationFailed below drives a UI warning and the
     // catch-up script (scripts/repair-result-appropriation.ts) posts the fix.
@@ -775,7 +780,7 @@ export async function generateOpeningBalances(
 /**
  * Best-effort reversal used by executeYearEndClosing's rollback paths.
  *
- * Posted journal entries are immutable per DB trigger — we can't truly
+ * Posted journal entries are immutable per DB trigger: we can't truly
  * roll them back, only post a compensating storno via reverseEntry().
  * Closed/locked periods may also block the reversal date. We swallow
  * failures here so the caller can re-throw the original invariant error

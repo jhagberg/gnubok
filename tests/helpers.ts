@@ -1,5 +1,5 @@
 /**
- * Shared test helpers — mock factories and fixture builders
+ * Shared test helpers: mock factories and fixture builders
  */
 import { vi } from 'vitest'
 import type {
@@ -60,7 +60,7 @@ export function createMockSupabase() {
     const handler: ProxyHandler<object> = {
       get(_target, prop) {
         if (prop === 'then') {
-          // Make the chain thenable — resolves to pendingResult
+          // Make the chain thenable: resolves to pendingResult
           return (resolve: (v: unknown) => void) => resolve(pendingResult)
         }
         // Return a function that returns a new chain
@@ -400,6 +400,7 @@ export function makeCustomer(overrides: Partial<Customer> = {}): Customer {
     company_id: 'company-1',
     name: 'Test AB',
     customer_type: 'swedish_business',
+    customer_number: null,
     email: 'kontakt@test.se',
     phone: null,
     address_line1: 'Storgatan 1',
@@ -522,6 +523,11 @@ export function makeCompanySettings(
     vat_number: null,
     moms_period: 'quarterly',
     periodisk_sammanstallning_period: 'quarterly',
+    vat_taxable_base_over_40m: false,
+    vat_has_eu_trade: false,
+    vat_filing_method: 'electronic',
+    periodisk_sammanstallning_enabled: false,
+    periodisk_sammanstallning_filing_method: 'electronic',
     tax_contact_name: null,
     tax_contact_phone: null,
     tax_contact_email: null,
@@ -538,6 +544,7 @@ export function makeCompanySettings(
     accounting_method: 'accrual',
     invoice_prefix: 'F',
     next_invoice_number: 1,
+    next_arrival_number: 1,
     next_delivery_note_number: 1,
     invoice_default_days: 30,
     invoice_default_notes: null,
@@ -583,10 +590,18 @@ export function makeCompanySettings(
     invoice_font_family: 'Helvetica',
     invoice_header_text: null,
     invoice_footer_text: null,
+    invoice_email_texts: null,
     send_invoice_reminders: true,
+    reminder_days_level_1: 15,
+    reminder_days_level_2: 30,
+    reminder_days_level_3: 45,
     reminder_fee_enabled: true,
     reminder_fee_amount: 60,
     reminder_interest_rate_override: null,
+    dimensions_enabled: false,
+    preferred_payment_format: 'pain001',
+    salary_pay_day: 25,
+    salary_default_bank: null,
     logo_url: null,
     onboarding_step: 6,
     onboarding_complete: true,

@@ -7,11 +7,13 @@ import {
 import { createSchedulesForSupplierInvoice } from '@/lib/bookkeeping/accruals/from-invoices'
 import { suggestBalanceAccount } from '@/lib/bookkeeping/accruals/account-suggestions'
 import { isBookkeepingError } from '@/lib/bookkeeping/errors'
+import { booksInvoicesOnIssue } from '@/lib/bookkeeping/booking-mode'
 import { ensureInitialized } from '@/lib/init'
 import { validateBody } from '@/lib/api/validate'
 import { CreateSupplierInvoiceSchema } from '@/lib/api/schemas'
 import { withRouteContext } from '@/lib/api/with-route-context'
 import { errorResponse, errorResponseFromCode } from '@/lib/errors/get-structured-error'
+import { linkToJournalEntry } from '@/lib/core/documents/document-service'
 import type { SupplierInvoice, SupplierInvoiceItem } from '@/types'
 
 ensureInitialized()
@@ -23,11 +25,18 @@ export const GET = withRouteContext(
 
     const { searchParams } = new URL(request.url)
     const status = searchParams.get('status')
+    const supplierId = searchParams.get('supplier_id')
 
     let query = supabase
       .from('supplier_invoices')
       .select('*, supplier:suppliers(id, name)')
       .eq('company_id', companyId)
+
+    // Optional narrowing to one supplier — the supplier detail page only
+    // needs that supplier's invoices, not the whole company ledger.
+    if (supplierId) {
+      query = query.eq('supplier_id', supplierId)
+    }
 
     if (status && status !== 'all') {
       if (status === 'to_pay') {
@@ -61,10 +70,46 @@ export const POST = withRouteContext(
     const body = validation.data
     const paidPrivately = body.paid_with_private_funds === true
 
+    if (body.document_id) {
+      const { data: document, error: documentError } = await supabase
+        .from('document_attachments')
+        .select('id, journal_entry_id')
+        .eq('id', body.document_id)
+        .eq('company_id', companyId)
+        .maybeSingle()
+
+      if (documentError || !document || document.journal_entry_id) {
+        return errorResponseFromCode('SI_CREATE_INVALID_INPUT', log, {
+          requestId,
+          details: { reason: 'document_id is missing, belongs to another company, or is already linked' },
+        })
+      }
+
+      const { data: existingDocumentUse, error: existingDocumentUseError } = await supabase
+        .from('supplier_invoices')
+        .select('id')
+        .eq('company_id', companyId)
+        .eq('document_id', body.document_id)
+        .limit(1)
+        .maybeSingle()
+
+      if (existingDocumentUseError) {
+        log.error('supplier invoice document usage lookup failed', existingDocumentUseError)
+        return errorResponse(existingDocumentUseError, log, { requestId })
+      }
+
+      if (existingDocumentUse) {
+        return errorResponseFromCode('SI_CREATE_INVALID_INPUT', log, {
+          requestId,
+          details: { reason: 'document_id is already used by a supplier invoice' },
+        })
+      }
+    }
+
     if (paidPrivately && body.reverse_charge) {
       // RC invoices come from registered businesses with formal invoices and
       // go through normal AP. "Privately paid" only makes sense for
-      // out-of-pocket kvitton — combining the two is a UI bug. 400, not 500.
+      // out-of-pocket kvitton: combining the two is a UI bug. 400, not 500.
       return errorResponseFromCode('SI_CREATE_INVALID_INPUT', log, {
         requestId,
         details: { reason: 'paid_with_private_funds is not supported with reverse_charge' },
@@ -76,12 +121,12 @@ export const POST = withRouteContext(
     )
     if (hasAccrualItems && body.reverse_charge) {
       // Omvänd skattskyldighet: the expense line IS the VAT base for rutor
-      // 20–32 — deferring the net to a 17xx interim account would corrupt the
+      // 20-32: deferring the net to a 17xx interim account would corrupt the
       // momsdeklaration. Mirrors the customer-side reverse-charge guard.
       return errorResponseFromCode('SI_CREATE_ACCRUAL_REVERSE_CHARGE', log, { requestId })
     }
     if (hasAccrualItems && paidPrivately) {
-      // Eget utlägg books the expense in one verifikat at registration —
+      // Eget utlägg books the expense in one verifikat at registration:
       // there is no interim-account flow to defer. UI hides the combination.
       return errorResponseFromCode('SI_CREATE_INVALID_INPUT', log, {
         requestId,
@@ -129,7 +174,7 @@ export const POST = withRouteContext(
       if (!company?.entity_type) {
         return errorResponseFromCode('SI_CREATE_FAILED', log, {
           requestId,
-          details: { reason: 'company entity_type missing — cannot pick owner account' },
+          details: { reason: 'company entity_type missing, cannot pick owner account' },
         })
       }
       entityType = company.entity_type as 'aktiebolag' | 'enskild_firma'
@@ -182,6 +227,9 @@ export const POST = withRouteContext(
           ? (item.accrual_balance_account ??
             suggestBalanceAccount('expense', item.account_number))
           : null,
+        // Dimensions PR7: per-item bag, merged over default_dimensions on the
+        // expense line at booking (supplier-invoice-entries.ts).
+        dimensions: item.dimensions ?? {},
       }
     })
 
@@ -193,11 +241,11 @@ export const POST = withRouteContext(
     const payableVat = body.reverse_charge ? 0 : vatAmount
     const total = Math.round((subtotal + payableVat) * 100) / 100
 
-    // Representation (BAS 6070–6079): ingående moms is only deductible up to
+    // Representation (BAS 6070-6079): ingående moms is only deductible up to
     // 300 SEK base/person per ML 8 kap. 1 §, and the income-tax deduction was
     // abolished in 2017 (IL 16 kap. 2 §). The engine debits 2641 for the full
     // VAT; we surface a non-blocking warning so the user can adjust manually.
-    // Only emit on the new private-funds path for now — other AP paths share
+    // Only emit on the new private-funds path for now: other AP paths share
     // the flaw and are tracked separately.
     const warnings: Array<{ code: string; message: string }> = []
     if (paidPrivately) {
@@ -206,7 +254,7 @@ export const POST = withRouteContext(
         warnings.push({
           code: 'REPRESENTATION_VAT_CAP',
           message:
-            'Representation (konto 6070–6079): ingående moms är endast avdragsgill ' +
+            'Representation (konto 6070-6079): ingående moms är endast avdragsgill ' +
             'upp till 300 kr/person (ML 8 kap. 1 §) och kostnaden är inte ' +
             'inkomstskattemässigt avdragsgill (IL 16 kap. 2 §). Justera bokföringen ' +
             'manuellt om beloppet överstiger gränsen.',
@@ -226,6 +274,7 @@ export const POST = withRouteContext(
         user_id: user.id,
         company_id: companyId,
         supplier_id: body.supplier_id,
+        document_id: body.document_id || null,
         arrival_number: arrivalNum,
         supplier_invoice_number: body.supplier_invoice_number,
         invoice_date: body.invoice_date,
@@ -250,6 +299,8 @@ export const POST = withRouteContext(
         notes: body.notes || null,
         // Display-only öresavrundning override; null = off (no retroactive rounding).
         ore_rounding: body.ore_rounding ?? null,
+        // Dimensions PR7: invoice-level bag; generators apply it to every line.
+        default_dimensions: body.default_dimensions ?? {},
       })
       .select()
       .single()
@@ -257,7 +308,7 @@ export const POST = withRouteContext(
     if (invoiceError || !invoice) {
       // Special-case the unique-index violation on (company_id, supplier_id,
       // supplier_invoice_number). The UI uses the embedded `existing` object
-      // to offer "undo crediting" — preserve that shape inside `details`.
+      // to offer "undo crediting": preserve that shape inside `details`.
       const pgErr = invoiceError as { code?: string; message?: string } | null
       const isDuplicateNumber =
         pgErr?.code === '23505' &&
@@ -331,7 +382,7 @@ export const POST = withRouteContext(
     }
 
     // Accrual method: create the registration journal entry. JE failure here
-    // is fatal — an orphan supplier_invoices row without a registration JE
+    // is fatal: an orphan supplier_invoices row without a registration JE
     // silently understates leverantörsskuld (2440) and ingående moms (2641)
     // for the momsdeklaration. Roll back instead.
     //
@@ -341,11 +392,14 @@ export const POST = withRouteContext(
     // invoked for these (status='paid' from the start).
     const { data: settings } = await supabase
       .from('company_settings')
-      .select('accounting_method')
+      .select('accounting_method, defer_invoice_booking')
       .eq('company_id', companyId)
       .single()
 
-    const accountingMethod = settings?.accounting_method || 'accrual'
+    // #967: deferred companies register WITHOUT booking; ekonomi books later
+    // via POST /api/supplier-invoices/[id]/book. The invoice then legitimately
+    // sits at registration_journal_entry_id = NULL, like the cash method.
+    const booksOnRegistration = booksInvoicesOnIssue(settings)
     let registrationJournalEntryId: string | null = null
     let paymentJournalEntryId: string | null = null
 
@@ -373,20 +427,20 @@ export const POST = withRouteContext(
             company_id: companyId,
             supplier_invoice_id: invoice.id,
             // For an eget utlägg the actual out-of-pocket date may differ from
-            // the invoice/receipt date — accept an explicit payment_date and
+            // the invoice/receipt date: accept an explicit payment_date and
             // fall back to invoice_date for the common kvitto case.
             payment_date: body.payment_date ?? invoice.invoice_date,
             amount: totalRounded,
             currency: invoice.currency,
             exchange_rate_difference: 0,
             journal_entry_id: journalEntry.id,
-            notes: 'Eget utlägg — betalat privat',
+            notes: 'Eget utlägg, betalat privat',
           })
         } else {
           // createSupplierInvoicePrivatelyPaidEntry returns null ONLY when no
           // fiscal period covers invoice_date (every other failure throws and
           // lands in the catch below). Without this branch the invoice would be
-          // saved as status='paid' with no verifikat — a silent orphan. Roll
+          // saved as status='paid' with no verifikat: a silent orphan. Roll
           // back and surface an actionable error, per the fatal-orphan note above.
           await supabase.from('supplier_invoices').delete().eq('id', invoice.id).eq('company_id', companyId)
           return errorResponseFromCode('SI_CREATE_NO_FISCAL_PERIOD', log, {
@@ -410,7 +464,7 @@ export const POST = withRouteContext(
           },
         })
       }
-    } else if (accountingMethod === 'accrual') {
+    } else if (booksOnRegistration) {
       try {
         const journalEntry = await createSupplierInvoiceRegistrationEntry(
           supabase,
@@ -429,7 +483,7 @@ export const POST = withRouteContext(
             .eq('id', invoice.id)
 
           if (hasAccrualItems) {
-            // The registration entry is committed (immutable) — a schedule
+            // The registration entry is committed (immutable): a schedule
             // failure must not roll the invoice back. Surface a warning and
             // let the user retry from the periodiseringar page instead.
             const idBySortOrder = new Map(
@@ -463,7 +517,7 @@ export const POST = withRouteContext(
           // fiscal period covers invoice_date (every other failure throws and
           // lands in the catch below). An orphan supplier_invoices row without a
           // registration JE silently understates leverantörsskuld (2440) and
-          // ingående moms (2641) for the momsdeklaration — exactly the fatal
+          // ingående moms (2641) for the momsdeklaration: exactly the fatal
           // case the note above warns about. Roll back and surface an
           // actionable error instead of returning 200.
           await supabase.from('supplier_invoices').delete().eq('id', invoice.id).eq('company_id', companyId)
@@ -486,6 +540,28 @@ export const POST = withRouteContext(
             reason: err instanceof Error ? err.message : 'unknown',
             step: 'registration_journal_entry',
           },
+        })
+      }
+    }
+
+    const primaryJournalEntryId = paymentJournalEntryId || registrationJournalEntryId
+    if (body.document_id && primaryJournalEntryId) {
+      try {
+        await linkToJournalEntry(
+          supabase,
+          companyId,
+          body.document_id,
+          primaryJournalEntryId,
+        )
+      } catch (err) {
+        log.warn('supplier invoice document could not be linked to journal entry', {
+          documentId: body.document_id,
+          journalEntryId: primaryJournalEntryId,
+          error: err instanceof Error ? err.message : String(err),
+        })
+        warnings.push({
+          code: 'DOCUMENT_LINK_FAILED',
+          message: 'Fakturan registrerades, men underlaget kunde inte kopplas till verifikationen.',
         })
       }
     }

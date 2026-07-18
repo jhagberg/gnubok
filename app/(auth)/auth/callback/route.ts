@@ -26,7 +26,7 @@ export async function GET(request: NextRequest) {
           cookiesToSet.forEach((cookie) => {
             // Mirror the cookie into request.cookies so subsequent getAll()
             // calls within this request lifecycle return the updated values
-            // (matches the pattern used in middleware.ts).
+            // (matches the pattern used in proxy.ts).
             request.cookies.set(cookie.name, cookie.value)
             pendingCookies.push(cookie)
           })
@@ -69,7 +69,7 @@ export async function GET(request: NextRequest) {
 
     const { data: { user } } = await supabase.auth.getUser()
     if (user) {
-      // Check MFA status — redirect to verify if factor is enrolled but session is AAL1
+      // Check MFA status: redirect to verify if factor is enrolled but session is AAL1
       const { data: aal } = await supabase.auth.mfa.getAuthenticatorAssuranceLevel()
       if (aal?.nextLevel === 'aal2' && aal?.currentLevel === 'aal1') {
         const response = NextResponse.redirect(new URL('/mfa/verify', origin))
@@ -113,8 +113,8 @@ export async function GET(request: NextRequest) {
               source: 'direct',
             })
 
-            // Set active company. Non-fatal on failure — middleware falls
-            // back to the membership created above — but log so silent
+            // Set active company. Non-fatal on failure (middleware falls
+            // back to the membership created above) but log so silent
             // persistence failures (#701) are observable.
             const { error: prefError } = await serviceClient.from('user_preferences').upsert({
               user_id: user.id,
@@ -131,7 +131,7 @@ export async function GET(request: NextRequest) {
               .update({ status: 'accepted' })
               .eq('id', invite.id)
 
-            // Invited user goes straight to dashboard — no onboarding needed
+            // Invited user goes straight to dashboard: no onboarding needed
             redirectPath = '/'
 
             // Clear invite cookie and set company cookie on response
@@ -164,27 +164,34 @@ export async function GET(request: NextRequest) {
         .maybeSingle()
 
       if (!teamMembership) {
-        // Create team via service client (RPC requires auth.uid() which isn't available here)
-        const serviceClient = createServerClient(
-          process.env.NEXT_PUBLIC_SUPABASE_URL!,
-          process.env.SUPABASE_SERVICE_ROLE_KEY!,
-          { cookies: { getAll: () => [], setAll: () => {} } }
-        )
+        // Create team via service client (RPC requires auth.uid() which isn't available here).
+        // Non-fatal: a failure here must not turn a successfully confirmed session into a
+        // 500 that reads as "signup verification failed". The dashboard / onboarding path
+        // recreates the silent team when it is missing, so log and continue.
+        try {
+          const serviceClient = createServerClient(
+            process.env.NEXT_PUBLIC_SUPABASE_URL!,
+            process.env.SUPABASE_SERVICE_ROLE_KEY!,
+            { cookies: { getAll: () => [], setAll: () => {} } }
+          )
 
-        const teamId = crypto.randomUUID()
-        await serviceClient.from('teams').insert({
-          id: teamId,
-          name: 'Personal',
-          created_by: user.id,
-        })
-        await serviceClient.from('team_members').insert({
-          team_id: teamId,
-          user_id: user.id,
-          role: 'owner',
-        })
+          const teamId = crypto.randomUUID()
+          await serviceClient.from('teams').insert({
+            id: teamId,
+            name: 'Personal',
+            created_by: user.id,
+          })
+          await serviceClient.from('team_members').insert({
+            team_id: teamId,
+            user_id: user.id,
+            role: 'owner',
+          })
+        } catch (err) {
+          console.error('[auth/callback] silent team creation failed:', err)
+        }
       }
 
-      // Always redirect to dashboard — it handles zero-company and incomplete states
+      // Always redirect to dashboard: it handles zero-company and incomplete states
       redirectPath = '/'
     }
 
@@ -198,6 +205,16 @@ export async function GET(request: NextRequest) {
     return response
   }
 
-  // Authentication failed — redirect to login with error
-  return NextResponse.redirect(new URL('/login?error=auth_error', origin))
+  // Authentication failed: redirect to login with error. Forward a coarse
+  // flow hint so the login page can show the right copy: a failed signup
+  // confirmation must not be framed as a failed password reset. On the PKCE
+  // (?code=) path there is no `type`, so recovery is identified by the
+  // next=/reset-password marker that resetPasswordForEmail sets; everything
+  // else defaults to the signup/confirmation framing.
+  const failedFlow =
+    type === 'recovery' || next === '/reset-password' ? 'recovery' : 'signup'
+  const loginUrl = new URL('/login', origin)
+  loginUrl.searchParams.set('error', 'auth_error')
+  loginUrl.searchParams.set('flow', failedFlow)
+  return NextResponse.redirect(loginUrl)
 }

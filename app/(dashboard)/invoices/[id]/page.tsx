@@ -12,9 +12,12 @@ import { Separator } from '@/components/ui/separator'
 import { useToast } from '@/components/ui/use-toast'
 import { formatCurrency, formatDate, cn } from '@/lib/utils'
 import { getVatTreatmentLabel } from '@/lib/invoices/vat-rules'
-import { invoiceDisplayNumber } from '@/lib/invoices/display'
+import { invoiceDisplayNumber, isTextLikeLine } from '@/lib/invoices/display'
 import { getDisplayTotal } from '@/lib/invoices/rounding'
 import { isEditableInvoiceDraft } from '@/lib/invoices/is-editable-draft'
+import { creditNoteNeedsJournalEntry } from '@/lib/invoices/issue-credit-note'
+import { getCreditNoteSendMode } from '@/lib/invoices/credit-note-send-mode'
+import { canCopyInvoice } from '@/lib/invoices/copy-invoice'
 import {
   Loader2,
   ArrowLeft,
@@ -33,8 +36,11 @@ import {
   Lock,
   CalendarClock,
   Pencil,
+  Copy,
 } from 'lucide-react'
 import { useCanWrite } from '@/lib/hooks/use-can-write'
+import { useCompany, useCapability } from '@/contexts/CompanyContext'
+import { CAPABILITY } from '@/lib/entitlements/keys'
 import PaymentBookingDialog from '@/components/invoices/PaymentBookingDialog'
 import SendInvoiceDialog from '@/components/invoices/SendInvoiceDialog'
 import CorrectionAffordance from '@/components/bookkeeping/CorrectionAffordance'
@@ -58,7 +64,7 @@ const statusVariantMap: Record<InvoiceStatus, 'default' | 'secondary' | 'success
   credited: 'secondary',
 }
 
-// A line is periodiserad when both period dates are set — the revenue was
+// A line is periodiserad when both period dates are set: the revenue was
 // parked on the 29xx interim account and dissolves monthly via accrual_schedules.
 const itemHasAccrual = (item: InvoiceItem): boolean =>
   !!(item.accrual_period_start && item.accrual_period_end)
@@ -77,6 +83,8 @@ interface InvoiceWithRelations extends Invoice {
 
 export default function InvoiceDetailPage({ params }: { params: Promise<{ id: string }> }) {
   const { canWrite } = useCanWrite()
+  const { isSandbox } = useCompany()
+  const canEmail = useCapability(CAPABILITY.email_send)
   const { id } = use(params)
   const router = useRouter()
   const { toast } = useToast()
@@ -116,6 +124,10 @@ export default function InvoiceDetailPage({ params }: { params: Promise<{ id: st
   const [nextNumberPreview, setNextNumberPreview] = useState<string | null>(null)
   const [oreRounding, setOreRounding] = useState<boolean>(true)
   const [vatRegistered, setVatRegistered] = useState<boolean>(true)
+  const [accountingMethod, setAccountingMethod] = useState<'accrual' | 'cash'>('accrual')
+  // #967: register/send without booking; ekonomi books in a separate step.
+  const [deferInvoiceBooking, setDeferInvoiceBooking] = useState(false)
+  const [reminderDays, setReminderDays] = useState<[number, number, number]>([15, 30, 45])
 
   const statusLabel = (status: InvoiceStatus): string => t(`status_${status}`)
   const reminderLevelLabel = (level: 1 | 2 | 3): string => t(`reminder_level_${level}`)
@@ -127,15 +139,36 @@ export default function InvoiceDetailPage({ params }: { params: Promise<{ id: st
   async function fetchInvoice() {
     setIsLoading(true)
 
-    const { data, error } = await supabase
-      .from('invoices')
-      .select(`
-        *,
-        customer:customers(*),
-        items:invoice_items(*)
-      `)
-      .eq('id', id)
-      .single()
+    // Invoice, reminders, and payments all key on the route id — one
+    // parallel batch. Only the follow-ups below need the invoice row.
+    const [{ data, error }, { data: reminderData }, { data: paymentData }] =
+      await Promise.all([
+        supabase
+          .from('invoices')
+          .select(`
+            *,
+            customer:customers(*),
+            items:invoice_items(*)
+          `)
+          .eq('id', id)
+          .single(),
+        supabase
+          .from('invoice_reminders')
+          .select('*')
+          .eq('invoice_id', id)
+          .order('sent_at', { ascending: false }),
+        // Payment history for the Betalningsstatus card. Joins the
+        // journal_entries row to get voucher_series + voucher_number so each
+        // payment row can link to its verifikat. Manual payments (no tx, no
+        // JE) still surface with the amount + date.
+        supabase
+          .from('invoice_payments')
+          .select(
+            'id, payment_date, amount, currency, journal_entry_id, journal_entries(voucher_series, voucher_number)',
+          )
+          .eq('invoice_id', id)
+          .order('payment_date', { ascending: true }),
+      ])
 
     if (error || !data) {
       toast({
@@ -154,44 +187,9 @@ export default function InvoiceDetailPage({ params }: { params: Promise<{ id: st
 
     setInvoice(data as InvoiceWithRelations)
 
-    // Fetch the öresavrundning + VAT-registration settings so the detail view
-    // matches the PDF (pdf-template.tsx:792 hides org_number / personnummer
-    // for private customers, and :876 suppresses the moms row when the seller
-    // is not VAT-registered and the invoice carries no VAT).
-    if (data.company_id) {
-      const { data: settings } = await supabase
-        .from('company_settings')
-        .select('ore_rounding, vat_registered')
-        .eq('company_id', data.company_id)
-        .maybeSingle()
-      setOreRounding(settings?.ore_rounding ?? true)
-      if (typeof settings?.vat_registered === 'boolean') {
-        setVatRegistered(settings.vat_registered)
-      }
-    }
-
-    // Fetch reminders for this invoice
-    const { data: reminderData } = await supabase
-      .from('invoice_reminders')
-      .select('*')
-      .eq('invoice_id', id)
-      .order('sent_at', { ascending: false })
-
     if (reminderData) {
       setReminders(reminderData as InvoiceReminder[])
     }
-
-    // Fetch payment history for the Betalningsstatus card. Joins the
-    // journal_entries row to get voucher_series + voucher_number so each
-    // payment row can link to its verifikat. Manual payments (no tx, no
-    // JE) still surface with the amount + date.
-    const { data: paymentData } = await supabase
-      .from('invoice_payments')
-      .select(
-        'id, payment_date, amount, currency, journal_entry_id, journal_entries(voucher_series, voucher_number)',
-      )
-      .eq('invoice_id', id)
-      .order('payment_date', { ascending: true })
 
     if (paymentData) {
       type PaymentRow = {
@@ -215,46 +213,103 @@ export default function InvoiceDetailPage({ params }: { params: Promise<{ id: st
       )
     }
 
-    // If this invoice is credited, find the credit note
-    if (data.status === 'credited') {
-      const { data: creditNoteData } = await supabase
-        .from('invoices')
-        .select('id, invoice_number')
-        .eq('credited_invoice_id', id)
-        .single()
+    // Follow-ups that need the invoice row: company settings (öresavrundning
+    // + VAT registration so the detail view matches the PDF — see
+    // pdf-template.tsx:792 and :876), the credit note, the original invoice,
+    // and the proforma source. Independent of each other → parallel.
+    const [settingsRes, creditNoteRes, originalRes, convertedRes] =
+      await Promise.all([
+        data.company_id
+          ? supabase
+              .from('company_settings')
+              .select('ore_rounding, vat_registered, accounting_method, defer_invoice_booking, reminder_days_level_1, reminder_days_level_2, reminder_days_level_3')
+              .eq('company_id', data.company_id)
+              .maybeSingle()
+          : Promise.resolve(null),
+        !data.credited_invoice_id &&
+        ['sent', 'paid', 'overdue', 'credited'].includes(data.status)
+          ? supabase
+              .from('invoices')
+              .select('id, invoice_number, status')
+              .eq('credited_invoice_id', id)
+              .neq('status', 'cancelled')
+              .maybeSingle()
+          : Promise.resolve(null),
+        data.credited_invoice_id
+          ? supabase
+              .from('invoices')
+              .select('id, invoice_number, status, journal_entry_id, paid_at, paid_amount, total')
+              .eq('id', data.credited_invoice_id)
+              .single()
+          : Promise.resolve(null),
+        data.converted_from_id
+          ? supabase
+              .from('invoices')
+              .select('id, invoice_number')
+              .eq('id', data.converted_from_id)
+              .single()
+          : Promise.resolve(null),
+      ])
 
-      if (creditNoteData) {
-        setCreditNote(creditNoteData as Invoice)
+    if (settingsRes) {
+      const settings = settingsRes.data
+      setOreRounding(settings?.ore_rounding ?? true)
+      if (typeof settings?.vat_registered === 'boolean') {
+        setVatRegistered(settings.vat_registered)
       }
+      setAccountingMethod(settings?.accounting_method === 'cash' ? 'cash' : 'accrual')
+      setDeferInvoiceBooking(!!settings?.defer_invoice_booking)
+      setReminderDays([
+        settings?.reminder_days_level_1 ?? 15,
+        settings?.reminder_days_level_2 ?? 30,
+        settings?.reminder_days_level_3 ?? 45,
+      ])
     }
-
-    // If this is a credit note, fetch the original invoice
-    if (data.credited_invoice_id) {
-      const { data: originalData } = await supabase
-        .from('invoices')
-        .select('id, invoice_number')
-        .eq('id', data.credited_invoice_id)
-        .single()
-
-      if (originalData) {
-        setOriginalInvoice(originalData as Invoice)
-      }
+    setCreditNote(creditNoteRes?.data ? (creditNoteRes.data as Invoice) : null)
+    if (originalRes?.data) {
+      setOriginalInvoice(originalRes.data as Invoice)
     }
-
-    // If this invoice was converted from a proforma, fetch it
-    if (data.converted_from_id) {
-      const { data: convertedData } = await supabase
-        .from('invoices')
-        .select('id, invoice_number')
-        .eq('id', data.converted_from_id)
-        .single()
-
-      if (convertedData) {
-        setConvertedFromInvoice(convertedData as Invoice)
-      }
+    if (convertedRes?.data) {
+      setConvertedFromInvoice(convertedRes.data as Invoice)
     }
 
     setIsLoading(false)
+  }
+
+  // #967: deferred booking: create the revenue verifikat afterwards.
+  async function handleBook() {
+    if (!invoice) return
+    setIsUpdating(true)
+    try {
+      const response = await fetch(`/api/invoices/${invoice.id}/book`, { method: 'POST' })
+      const data = await response.json()
+      if (!response.ok) {
+        // data.error is a structured object for this route; only strings are
+        // usable as a toast message.
+        const message =
+          typeof data.error === 'string'
+            ? data.error
+            : typeof data.error?.message === 'string'
+              ? data.error.message
+              : t('book_failed_fallback')
+        throw new Error(message)
+      }
+      if (Array.isArray(data.warnings) && data.warnings.length > 0) {
+        // Booked, but a follow-up is needed (e.g. periodiseringar failed).
+        toast({ title: t('booked_title'), description: t('booked_with_warnings_description'), variant: 'destructive' })
+      } else {
+        toast({ title: t('booked_title'), description: t('booked_description') })
+      }
+      fetchInvoice()
+    } catch (error) {
+      toast({
+        title: t('book_failed_title'),
+        description: error instanceof Error ? error.message : t('fallback_try_again'),
+        variant: 'destructive',
+      })
+    } finally {
+      setIsUpdating(false)
+    }
   }
 
   async function updateStatus(status: InvoiceStatus) {
@@ -273,7 +328,7 @@ export default function InvoiceDetailPage({ params }: { params: Promise<{ id: st
           throw new Error(data.error || t('mark_sent_failed_fallback'))
         }
       } else if (status === 'cancelled') {
-        // Only drafts and proformas can be cancelled directly — sent/overdue/paid
+        // Only drafts and proformas can be cancelled directly: sent/overdue/paid
         // invoices have committed journal entries and require a credit note instead
         if (invoice.status !== 'draft') {
           const docType = ((invoice as Invoice & { document_type?: InvoiceDocumentType }).document_type || 'invoice') as InvoiceDocumentType
@@ -400,7 +455,7 @@ export default function InvoiceDetailPage({ params }: { params: Promise<{ id: st
         const preview = json?.data?.preview
         // Only show a value that looks like a real invoice number. Guards the
         // preview against an unexpected/oversized API response being rendered
-        // verbatim — a short alphanumeric token (optional series prefix), never
+        // verbatim, a short alphanumeric token (optional series prefix), never
         // free-form text.
         setNextNumberPreview(
           typeof preview === 'string' && /^[A-Za-z0-9-]{1,32}$/.test(preview) ? preview : null
@@ -411,7 +466,7 @@ export default function InvoiceDetailPage({ params }: { params: Promise<{ id: st
     }
   }
 
-  // "Granska & skapa" — finalize an unnumbered draft into a real invoice:
+  // "Granska & skapa": finalize an unnumbered draft into a real invoice:
   // allocate the F-number and emit invoice.created. After this the invoice
   // behaves like any draft (send / makulera), no longer hard-deletable.
   async function finalizeInvoice() {
@@ -466,7 +521,7 @@ export default function InvoiceDetailPage({ params }: { params: Promise<{ id: st
       // Unnumbered drafts are hard deleted ("Ta bort"); numbered drafts are
       // makulerade and keep their number in the series.
       toast(
-        invoice.invoice_number
+        invoice.invoice_number && !invoice.credited_invoice_id
           ? {
               title: t('cancelled_toast_title'),
               description: t('cancelled_with_number', { number: invoice.invoice_number }),
@@ -477,7 +532,11 @@ export default function InvoiceDetailPage({ params }: { params: Promise<{ id: st
             }
       )
 
-      router.push('/invoices')
+      router.push(
+        invoice.credited_invoice_id
+          ? `/invoices/${invoice.credited_invoice_id}`
+          : '/invoices',
+      )
     } catch (error) {
       toast({
         title: t('cancel_failed_title'),
@@ -509,22 +568,51 @@ export default function InvoiceDetailPage({ params }: { params: Promise<{ id: st
   const isProforma = docType === 'proforma'
   const isDeliveryNote = docType === 'delivery_note'
   const isRealInvoice = docType === 'invoice'
+  const isCreditNote = !!invoice.credited_invoice_id
+  const booksOnIssue = isCreditNote
+    ? !!originalInvoice && creditNoteNeedsJournalEntry(accountingMethod, originalInvoice)
+    : accountingMethod === 'accrual' && !deferInvoiceBooking
+  // #967: sent under deferred booking; ekonomi books the revenue verifikat
+  // from here afterwards.
+  const canBookAfterwards =
+    isRealInvoice &&
+    !isCreditNote &&
+    !invoice.journal_entry_id &&
+    accountingMethod === 'accrual' &&
+    ['sent', 'overdue'].includes(invoice.status)
+  const preferredSendMode = getCreditNoteSendMode({
+    customerHasEmail,
+    isSandbox,
+    canEmail,
+  })
+  const creditNoteNeedsRepair =
+    isCreditNote &&
+    invoice.status === 'sent' &&
+    !!originalInvoice &&
+    (
+      originalInvoice.status !== 'credited' ||
+      (
+        creditNoteNeedsJournalEntry(accountingMethod, originalInvoice) &&
+        !invoice.journal_entry_id
+      )
+    )
   // An unnumbered draft is one saved via "Spara som utkast" that hasn't been
-  // finalized — no F-number yet, so it can still be reviewed-and-created or
+  // finalized: no F-number yet, so it can still be reviewed-and-created or
   // hard-deleted. Once finalized it gets a number and behaves like any draft.
   const isUnnumberedDraft = invoice.status === 'draft' && !invoice.invoice_number && isRealInvoice
   // A numbered draft is issued-but-unsent ("Ej skickad"), distinct from an
-  // unnumbered draft ("Utkast"). Display-only — the DB status stays 'draft'.
+  // unnumbered draft ("Utkast"). Display-only: the DB status stays 'draft'.
   const isUnsentNumberedInvoice = invoice.status === 'draft' && !!invoice.invoice_number && isRealInvoice
   const displayStatusVariant = isUnsentNumberedInvoice ? 'outline' : statusVariant
   const displayStatusLabel = isUnsentNumberedInvoice ? t('status_unsent') : statusLabel(invoice.status)
   // Self-billing invoices we received: the document is the counterparty's, so
-  // there is no own PDF to render and no send step — it arrives already booked.
+  // there is no own PDF to render and no send step: it arrives already booked.
   const isSelfBilled = !!invoice.is_self_billed
   // A draft (no committed verifikat, not sent, not self-billed) can be edited
-  // in place — header + lines — via /invoices/{id}/edit. Sent/paid invoices are
+  // in place (header + lines) via /invoices/{id}/edit. Sent/paid invoices are
   // immutable (BFL); they are corrected with a credit note instead.
   const isEditableDraft = isEditableInvoiceDraft(invoice)
+  const isCopyable = canCopyInvoice(invoice)
   const hasAccruedItems = invoice.items.some(itemHasAccrual)
   return (
     <div className="space-y-8">
@@ -536,7 +624,7 @@ export default function InvoiceDetailPage({ params }: { params: Promise<{ id: st
           </Button>
           <div>
             <div className="flex flex-wrap items-center gap-2 sm:gap-3">
-              <h1 className={cn('font-display text-2xl sm:text-3xl tracking-tight', !invoice.invoice_number && !isSelfBilled && 'italic text-muted-foreground')}>{isSelfBilled ? invoiceDisplayNumber(invoice as Invoice) : (invoice.invoice_number ?? '—')}</h1>
+              <h1 className={cn('font-display text-2xl sm:text-3xl tracking-tight', !invoice.invoice_number && !isSelfBilled && 'italic text-muted-foreground')}>{isSelfBilled ? invoiceDisplayNumber(invoice as Invoice) : (invoice.invoice_number ?? '-')}</h1>
               {isProforma && (
                 <Badge variant="outline">{t('badge_proforma')}</Badge>
               )}
@@ -600,14 +688,14 @@ export default function InvoiceDetailPage({ params }: { params: Promise<{ id: st
             </Button>
           )}
           {invoice.status === 'draft' && !isDeliveryNote && invoice.invoice_number && (
-            customerHasEmail ? (
+            preferredSendMode === 'email' ? (
               <Button
                 onClick={() => openSendDialog('email')}
                 disabled={!canWrite}
                 title={!canWrite ? t('viewer_disabled_tooltip') : undefined}
               >
                 {canWrite ? <Mail className="mr-2 h-4 w-4" /> : <Lock className="mr-2 h-4 w-4" />}
-                {t('send_via_email')}
+                {t(booksOnIssue ? 'send_via_email_and_book' : 'send_via_email')}
               </Button>
             ) : (
               <Button
@@ -617,9 +705,28 @@ export default function InvoiceDetailPage({ params }: { params: Promise<{ id: st
                 title={!canWrite ? t('viewer_disabled_tooltip') : undefined}
               >
                 {canWrite ? <Send className="mr-2 h-4 w-4" /> : <Lock className="mr-2 h-4 w-4" />}
-                {t('mark_sent_manually')}
+                {t(booksOnIssue ? 'mark_sent_and_book' : 'mark_as_sent')}
               </Button>
             )
+          )}
+          {isCopyable && canWrite && (
+            <Link href={`/invoices?copy=${invoice.id}`}>
+              <Button variant="outline">
+                <Copy className="mr-2 h-4 w-4" />
+                {t('copy_invoice')}
+              </Button>
+            </Link>
+          )}
+          {creditNoteNeedsRepair && (
+            <Button
+              variant="secondary"
+              onClick={() => openSendDialog('manual')}
+              disabled={!canWrite}
+              title={!canWrite ? t('viewer_disabled_tooltip') : undefined}
+            >
+              {canWrite ? <AlertTriangle className="mr-2 h-4 w-4" /> : <Lock className="mr-2 h-4 w-4" />}
+              {t('complete_credit_bookkeeping')}
+            </Button>
           )}
           {isDeliveryNote && invoice.status === 'draft' && (
             <Button
@@ -632,7 +739,7 @@ export default function InvoiceDetailPage({ params }: { params: Promise<{ id: st
               {t('mark_as_sent')}
             </Button>
           )}
-          {(invoice.status === 'sent' || invoice.status === 'overdue') && isRealInvoice && (
+          {(invoice.status === 'sent' || invoice.status === 'overdue') && isRealInvoice && !isCreditNote && (
             <Button
               onClick={() => setShowPaymentDialog(true)}
               disabled={isUpdating || !canWrite}
@@ -642,7 +749,7 @@ export default function InvoiceDetailPage({ params }: { params: Promise<{ id: st
               {t('mark_as_paid')}
             </Button>
           )}
-          {/* No own PDF for a received self-billing invoice — the verifikationsunderlag is the document the customer sent us. */}
+          {/* No own PDF for a received self-billing invoice: the verifikationsunderlag is the document the customer sent us. */}
           {!isSelfBilled && (
             <Button variant="outline" onClick={downloadPDF} disabled={isDownloading}>
               {isDownloading ? (
@@ -700,7 +807,7 @@ export default function InvoiceDetailPage({ params }: { params: Promise<{ id: st
           </CardHeader>
           <CardContent>
             <div className="space-y-4">
-              {/* Header — desktop */}
+              {/* Header, desktop */}
               <div className="hidden sm:grid grid-cols-12 gap-4 text-sm font-medium text-muted-foreground border-b pb-2">
                 <div className="col-span-5">{t('th_description')}</div>
                 <div className="col-span-2 text-right">{t('th_quantity')}</div>
@@ -709,11 +816,11 @@ export default function InvoiceDetailPage({ params }: { params: Promise<{ id: st
                 <div className="col-span-2 text-right">{t('th_amount')}</div>
               </div>
 
-              {/* Items — desktop. Free-text rows span the full width with no
+              {/* Items, desktop. Free-text rows span the full width with no
                   numeric columns; a blank one renders as a spacer. */}
               <div className="hidden sm:block space-y-4">
                 {invoice.items.map((item) =>
-                  item.line_type === 'text' ? (
+                  isTextLikeLine(item) ? (
                     <div key={item.id} className="grid grid-cols-12 gap-4 text-sm">
                       <div className="col-span-12 text-muted-foreground">{item.description || ' '}</div>
                     </div>
@@ -747,10 +854,10 @@ export default function InvoiceDetailPage({ params }: { params: Promise<{ id: st
                 )}
               </div>
 
-              {/* Items — mobile cards */}
+              {/* Items, mobile cards */}
               <div className="sm:hidden space-y-2">
                 {invoice.items.map((item) =>
-                  item.line_type === 'text' ? (
+                  isTextLikeLine(item) ? (
                     <p key={item.id} className="text-sm text-muted-foreground px-1">{item.description || ' '}</p>
                   ) : (
                     <div key={item.id} className="border rounded-lg p-3 text-sm space-y-1.5">
@@ -873,7 +980,7 @@ export default function InvoiceDetailPage({ params }: { params: Promise<{ id: st
             <CardContent className="space-y-4">
               <div className="flex justify-between">
                 <span className="text-muted-foreground">{isSelfBilled ? t('external_number_label') : t('invoice_number_label')}</span>
-                <span className={cn('font-medium', !invoice.invoice_number && !isSelfBilled && 'italic text-muted-foreground')}>{isSelfBilled ? invoiceDisplayNumber(invoice as Invoice) : (invoice.invoice_number ?? '—')}</span>
+                <span className={cn('font-medium', !invoice.invoice_number && !isSelfBilled && 'italic text-muted-foreground')}>{isSelfBilled ? invoiceDisplayNumber(invoice as Invoice) : (invoice.invoice_number ?? '-')}</span>
               </div>
               {isSelfBilled && (invoice as Invoice).self_billing_agreement_ref && (
                 <div className="flex justify-between">
@@ -916,6 +1023,22 @@ export default function InvoiceDetailPage({ params }: { params: Promise<{ id: st
                   </span>
                 </div>
               )}
+              {canBookAfterwards && (
+                <>
+                  <Separator />
+                  <div className="flex items-center justify-between gap-3">
+                    <span className="text-muted-foreground text-sm">{t('bookkeeping_label')}</span>
+                    <div className="flex items-center gap-3">
+                      <span className="text-sm text-muted-foreground">{t('not_booked_yet')}</span>
+                      {canWrite && (
+                        <Button size="sm" onClick={handleBook} disabled={isUpdating}>
+                          {t('book_action')}
+                        </Button>
+                      )}
+                    </div>
+                  </div>
+                </>
+              )}
               {invoice.journal_entry_id && (
                 <>
                   <Separator />
@@ -956,7 +1079,7 @@ export default function InvoiceDetailPage({ params }: { params: Promise<{ id: st
               so the user always sees how much has been paid + what remains +
               the individual payment events. Previously only the `paid` case
               had a card, leaving partially-paid invoices without any visible
-              paid_amount/remaining_amount — surfaced by user feedback after
+              paid_amount/remaining_amount: surfaced by user feedback after
               PR #614. */}
           {(invoice.status === 'paid' || invoice.status === 'partially_paid') && (
             <Card>
@@ -1017,7 +1140,7 @@ export default function InvoiceDetailPage({ params }: { params: Promise<{ id: st
                 )}
 
                 {/* Payment history. Each row links to its verifikat when one
-                    exists. Compact list — dates and amounts tabular-nums for
+                    exists. Compact list: dates and amounts tabular-nums for
                     column alignment, the voucher link sits to the right with
                     a small chevron. */}
                 <div className="space-y-2">
@@ -1079,7 +1202,11 @@ export default function InvoiceDetailPage({ params }: { params: Promise<{ id: st
                 </CardTitle>
                 {reminders.length === 0 && (
                   <CardDescription>
-                    {t('reminders_description')}
+                    {t('reminders_description', {
+                      day1: reminderDays[0],
+                      day2: reminderDays[1],
+                      day3: reminderDays[2],
+                    })}
                   </CardDescription>
                 )}
               </CardHeader>
@@ -1135,22 +1262,26 @@ export default function InvoiceDetailPage({ params }: { params: Promise<{ id: st
           )}
 
           {/* Credit note reference (if this invoice was credited) */}
-          {invoice.status === 'credited' && creditNote && (
-            <Card className="border-warning/50">
+          {creditNote && (
+            <Card className={creditNote.status === 'draft' ? undefined : 'border-warning/50'}>
               <CardHeader>
-                <CardTitle className="flex items-center gap-2 text-warning">
+                <CardTitle className={cn(
+                  'flex items-center gap-2',
+                  creditNote.status !== 'draft' && 'text-warning',
+                )}>
                   <ReceiptText className="h-5 w-5" />
-                  {t('credited_card_title')}
+                  {creditNote.status === 'draft'
+                    ? t('credit_draft_card_title')
+                    : t('credited_card_title')}
                 </CardTitle>
               </CardHeader>
               <CardContent>
-                <p className="text-sm text-muted-foreground mb-2">
-                  {t('credited_description')}
-                </p>
                 <Link href={`/invoices/${creditNote.id}`}>
                   <Button variant="outline" size="sm" className="w-full">
                     <ExternalLink className="mr-2 h-4 w-4" />
-                    {t('see_credit_note', { number: creditNote.invoice_number ?? '' })}
+                    {creditNote.status === 'draft'
+                      ? t('open_credit_draft', { number: creditNote.invoice_number ?? '' })
+                      : t('see_credit_note', { number: creditNote.invoice_number ?? '' })}
                   </Button>
                 </Link>
               </CardContent>
@@ -1204,14 +1335,14 @@ export default function InvoiceDetailPage({ params }: { params: Promise<{ id: st
           )}
 
           {/* Status actions */}
-          {invoice.status !== 'cancelled' && invoice.status !== 'credited' && !invoice.credited_invoice_id && (
+          {invoice.status !== 'cancelled' && invoice.status !== 'credited' && (!invoice.credited_invoice_id || invoice.status === 'draft') && (
             <Card>
               <CardHeader>
                 <CardTitle>{t('actions_card_title')}</CardTitle>
               </CardHeader>
               {/* Secondary actions only. The primary next-step for every status
                   (convert / finalize / send / mark-paid) lives in the header
-                  action row next to the status badge — this card holds the
+                  action row next to the status badge: this card holds the
                   reversible/destructive alternatives so there is one obvious
                   next step, not two competing copies of it. */}
               <CardContent className="space-y-2">
@@ -1242,7 +1373,7 @@ export default function InvoiceDetailPage({ params }: { params: Promise<{ id: st
                       {/* When the customer has an email the header offers "Send via
                           email" as the primary; keep the manual-mark-sent path here
                           as the secondary alternative (it is not in the header). */}
-                      {!isDeliveryNote && customerHasEmail && (
+                      {!isDeliveryNote && preferredSendMode === 'email' && (
                         <>
                           <Button
                             variant="ghost"
@@ -1250,7 +1381,7 @@ export default function InvoiceDetailPage({ params }: { params: Promise<{ id: st
                             onClick={() => openSendDialog('manual')}
                           >
                             <Send className="mr-2 h-4 w-4" />
-                            {t('mark_sent_manually')}
+                            {t(booksOnIssue ? 'mark_sent_and_book' : 'mark_as_sent')}
                           </Button>
                           <p className="text-[11px] text-muted-foreground/60 px-1 -mt-1">
                             {t('send_manual_hint_with_email')}
@@ -1264,12 +1395,12 @@ export default function InvoiceDetailPage({ params }: { params: Promise<{ id: st
                         disabled={isDeleting}
                       >
                         <Trash2 className="mr-2 h-4 w-4" />
-                        {t('delete_draft')}
+                        {t(isCreditNote ? 'remove_credit_draft' : 'delete_draft')}
                       </Button>
                     </>
                   )
                 )}
-                {((invoice.status === 'sent' || invoice.status === 'overdue' || invoice.status === 'paid') && isRealInvoice) && (
+                {((invoice.status === 'sent' || invoice.status === 'overdue' || invoice.status === 'paid') && isRealInvoice && !creditNote) && (
                   <Link href={`/invoices/${invoice.id}/credit`} className="block">
                     <Button variant="outline" className="w-full">
                       <ReceiptText className="mr-2 h-4 w-4" />
@@ -1283,15 +1414,23 @@ export default function InvoiceDetailPage({ params }: { params: Promise<{ id: st
         </div>
       </div>
 
-      {/* Remove/cancel confirmation. A numbered draft is makulerad (status flips
-          to 'cancelled', number retained for a gap-free series); an unnumbered
-          draft is hard deleted since it never entered the number series. */}
+      {/* Remove/cancel confirmation. An unissued credit-note draft and an
+          unnumbered invoice draft are hard deleted; other numbered drafts are
+          retained as cancelled to preserve their number series. */}
       <Dialog open={showDeleteDialog} onOpenChange={setShowDeleteDialog}>
         <DialogContent>
           <DialogHeader>
-            <DialogTitle>{invoice.invoice_number ? t('delete_dialog_title') : t('remove_dialog_title')}</DialogTitle>
+            <DialogTitle>
+              {isCreditNote
+                ? t('remove_credit_dialog_title')
+                : invoice.invoice_number
+                  ? t('delete_dialog_title')
+                  : t('remove_dialog_title')}
+            </DialogTitle>
             <DialogDescription>
-              {invoice.invoice_number ? (
+              {isCreditNote ? (
+                t('remove_credit_dialog_desc')
+              ) : invoice.invoice_number ? (
                 <>
                   {t('delete_dialog_desc_with_number_1')}
                   <strong>{t('delete_dialog_status_makulerad')}</strong>
@@ -1313,13 +1452,17 @@ export default function InvoiceDetailPage({ params }: { params: Promise<{ id: st
             </Button>
             <Button variant="destructive" onClick={deleteInvoice} disabled={isDeleting}>
               {isDeleting && <Loader2 className="mr-2 h-4 w-4 animate-spin" />}
-              {invoice.invoice_number ? t('delete_dialog_confirm') : t('remove_dialog_confirm')}
+              {isCreditNote
+                ? t('remove_credit_dialog_confirm')
+                : invoice.invoice_number
+                  ? t('delete_dialog_confirm')
+                  : t('remove_dialog_confirm')}
             </Button>
           </DialogFooter>
         </DialogContent>
       </Dialog>
 
-      {/* Finalize confirmation — "Granska & skapa". Allocates the F-number and
+      {/* Finalize confirmation, "Granska & skapa". Allocates the F-number and
           turns the unnumbered draft into a real, issued invoice. */}
       <Dialog open={showFinalizeDialog} onOpenChange={setShowFinalizeDialog}>
         <DialogContent>

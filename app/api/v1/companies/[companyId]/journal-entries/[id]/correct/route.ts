@@ -6,9 +6,11 @@
  * posted with the new lines. All three remain in the verifikationsserie,
  * linked via reverses_id, reversed_by_id, and correction_of_id.
  *
- * Body: `{ lines: [...] }` — the new balanced lines. The corrected entry
- * inherits entry_date, fiscal_period_id, description, and voucher_series
- * from the original.
+ * Body: `{ lines: [...], description? }`: the new balanced lines. The
+ * corrected entry inherits entry_date, fiscal_period_id, and voucher_series
+ * from the original. Its description defaults to "Rättelse: <original>";
+ * pass `description` to override it (e.g. when the original label named the
+ * wrong account).
  *
  * Idempotent (mandatory Idempotency-Key). Dry-runnable.
  */
@@ -42,9 +44,9 @@ registerEndpoint({
   description:
     'Per Bokföringslagen 5 kap 5 §, posted entries cannot be modified. This endpoint creates the canonical correction trail: a storno reversing the original, then a new entry with the corrected lines. All three are visible in the verifikationsserie and linked via reverses_id / reversed_by_id / correction_of_id. Idempotent. Dry-runnable.',
   useWhen:
-    'You need to amend a posted verifikation. Use this rather than /reverse when the entry is being REPLACED with new lines — /reverse just nullifies.',
+    'You need to amend a posted verifikation. Use this rather than /reverse when the entry is being REPLACED with new lines: /reverse just nullifies.',
   doNotUseFor:
-    'Drafts (no voucher_number — cancel via dashboard). Already-corrected entries (the chain only supports one correction; correct the latest in the chain).',
+    'Drafts (no voucher_number: cancel via dashboard). Already-corrected entries (the chain only supports one correction; correct the latest in the chain).',
   pitfalls: [
     'Idempotency-Key is mandatory.',
     'The new lines must balance. JOURNAL_ENTRY_NOT_BALANCED if not.',
@@ -108,7 +110,7 @@ export const POST = withApiV1<{ params: Promise<{ companyId: string; id: string 
         details: { issues: parsed.error.issues.map((i) => ({ field: i.path.join('.'), message: i.message })) },
       })
     }
-    const { lines } = parsed.data
+    const { lines, description } = parsed.data
 
     const balance = validateBalance(lines)
     if (!balance.valid) {
@@ -178,6 +180,7 @@ export const POST = withApiV1<{ params: Promise<{ companyId: string; id: string 
         ctx.userId,
         entryId,
         lines,
+        { description },
       )
       return ok(
         {

@@ -4,6 +4,7 @@ import { useCallback, useEffect, useRef, useState } from 'react'
 import {
   AlertCircle,
   CheckCircle2,
+  Circle,
   Download,
   ExternalLink,
   Link2,
@@ -15,20 +16,32 @@ import {
   ShieldAlert,
   Unlock,
 } from 'lucide-react'
+import { useTranslations } from 'next-intl'
 import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card'
 import { Button } from '@/components/ui/button'
+import { InfoTooltip } from '@/components/ui/info-tooltip'
+import { useToast } from '@/components/ui/use-toast'
+import { UpgradeNote } from '@/components/billing/UpgradeNote'
 import { useCapability } from '@/contexts/CompanyContext'
 import { CAPABILITY } from '@/lib/entitlements/keys'
+import type { AgiSubmissionState } from '@/lib/salary/agi-submission-state'
 
 interface AGIPanelProps {
   salaryRunId: string
-  /** Skatteverket arbetsgivare ID (12-digit) — formatted by parent. */
+  /** Skatteverket arbetsgivare ID (12-digit): formatted by parent. */
   arbetsgivare: string
   /** YYYYMM */
   period: string
   /** Already-cached run-level signals for showing what step we're at. */
   agiGeneratedAt?: string | null
   agiSubmittedAt?: string | null
+  /**
+   * Per-period submission record, owned by the parent (via useAgiSubmission)
+   * so the progress rail and hero can render the same state machine.
+   */
+  submission: AgiSubmissionState | null
+  /** Refetch the submission record after a state-changing action. */
+  onRefreshSubmission: () => void
   /** When true, write actions are hidden. */
   readOnly?: boolean
   /** Called after a state-changing action so parent can refresh. */
@@ -57,28 +70,6 @@ interface KontrollFinding {
   identifierare?: string
 }
 
-/**
- * Local submission state mirrored in extension_data under
- * `agi_submission_{period}`. Matches the `status` enum the index.ts handlers
- * write back. Strict superset of what the UI actually keys off.
- */
-interface SubmissionState {
-  status?:
-    | 'underlag_submitted'         // POST /underlag returned an inlamningId
-    | 'underlag_rejected'          // kontrollresultat surfaced stoppande fel
-    | 'awaiting_signing'           // skapaGranskningsunderlag returned a link
-    | 'signed'                     // kvittenser shows uuidKvittens for the period
-  signeringslank?: string
-  kvittensnummer?: string
-  signeradAv?: string
-  signeradTid?: string
-  inlamningId?: number
-  tillstand?: string
-  meddelande?: string
-  /** ISO timestamp the submission record was last written by the extension. */
-  updatedAt?: string
-}
-
 /** Subset of SkatteverketAGIKontrollresultat we use in the panel. */
 interface Kontrollresultat {
   status: 'PROCESSING' | 'DONE_SUCCESS' | 'DONE_FAILED' | 'DONE_REJECTED'
@@ -103,6 +94,36 @@ interface Kontrollresultat {
 
 const ENABLED_KEY = 'EXTENSION_DISABLED'
 
+/** One-click chain steps, in execution order. */
+const CHAIN_STEPS = ['generate', 'submit', 'kontroll', 'link'] as const
+type ChainStep = (typeof CHAIN_STEPS)[number]
+
+interface ChainProgress {
+  current: ChainStep
+  failed: boolean
+  done: boolean
+}
+
+/**
+ * Sentinel for chain aborts where the failing step already surfaced its
+ * error via setError/setKontroller: the catch block must not overwrite it.
+ */
+class ChainFailed extends Error {}
+
+/**
+ * Extract a human message from either the canonical { error: { message } }
+ * envelope (internal routes) or a plain { error: string } (extension routes).
+ */
+function errText(data: unknown): string | null {
+  if (!data || typeof data !== 'object') return null
+  const err = (data as { error?: unknown }).error
+  if (typeof err === 'string') return err
+  if (err && typeof err === 'object' && typeof (err as { message?: unknown }).message === 'string') {
+    return (err as { message: string }).message
+  }
+  return null
+}
+
 export function AGIPanel(props: AGIPanelProps) {
   const {
     salaryRunId,
@@ -110,20 +131,52 @@ export function AGIPanel(props: AGIPanelProps) {
     period,
     agiGeneratedAt,
     agiSubmittedAt,
+    submission,
+    onRefreshSubmission,
     readOnly,
     onChange,
   } = props
 
+  const t = useTranslations('salary_agi')
+  const { toast } = useToast()
   const hasSkatteverket = useCapability(CAPABILITY.skatteverket)
 
   const [extensionDisabled, setExtensionDisabled] = useState(false)
   const [status, setStatus] = useState<ConnectionStatus | null>(null)
-  const [submission, setSubmission] = useState<SubmissionState | null>(null)
   const [kontroller, setKontroller] = useState<KontrollFinding[]>([])
   const [loading, setLoading] = useState(true)
   const [actionLoading, setActionLoading] = useState<string | null>(null)
   const [error, setError] = useState<string | null>(null)
   const [success, setSuccess] = useState<string | null>(null)
+  const [chain, setChain] = useState<ChainProgress | null>(null)
+  const [showAdvanced, setShowAdvanced] = useState(false)
+  // True while an OAuth tab opened from this panel is still alive. Disables
+  // the connect buttons so a second click cannot start a parallel flow: each
+  // /authorize call overwrites the stored oauth_state + PKCE verifier, so a
+  // parallel flow guarantees a CSRF failure for whichever tab finishes last.
+  const [connecting, setConnecting] = useState(false)
+
+  // "2026-06" for user-facing copy; the period prop is compact YYYYMM.
+  const prettyPeriod = `${period.slice(0, 4)}-${period.slice(4)}`
+
+  // ── Derived filing state (needed by hooks, so derived before any return) ──
+  const subState = submission?.status
+  const awaitingSigning = subState === 'awaiting_signing'
+  const underlagSubmitted = subState === 'underlag_submitted'
+  const underlagRejected = subState === 'underlag_rejected'
+  const isSigned = subState === 'signed' || !!agiSubmittedAt
+  // The submission state is keyed by PERIOD; AGI generation is keyed by RUN.
+  // If the run's AGI was (re)generated AFTER this signing draft was created,
+  // the locked underlag at Skatteverket reflects superseded figures and must
+  // not be signed: surface a warning and steer the user to unlock + resubmit
+  // rather than presenting it as ready to sign (avoids filing stale amounts).
+  const draftUpdatedAt = submission?.updatedAt ? new Date(submission.updatedAt) : null
+  const draftIsStale =
+    awaitingSigning &&
+    !!agiGeneratedAt &&
+    !!draftUpdatedAt &&
+    !Number.isNaN(draftUpdatedAt.getTime()) &&
+    new Date(agiGeneratedAt).getTime() > draftUpdatedAt.getTime()
 
   const fetchStatus = useCallback(async () => {
     setLoading(true)
@@ -144,7 +197,7 @@ export function AGIPanel(props: AGIPanelProps) {
         // round-trip, leaving the old "Sessionen har gått ut" message in
         // place even though the token is now fresh. This wipes the error
         // only when (a) there's currently an error and (b) the new status
-        // says we're healthy — never silently swallowing unrelated errors.
+        // says we're healthy: never silently swallowing unrelated errors.
         const isHealthy = next.connected && !next.expired && next.canRefresh !== false
         if (isHealthy) {
           setError(prev =>
@@ -155,30 +208,36 @@ export function AGIPanel(props: AGIPanelProps) {
         }
       }
     } catch {
-      // ignore — UI shows the not-connected state
+      // ignore: UI shows the not-connected state
     } finally {
       setLoading(false)
     }
   }, [])
 
-  const fetchSubmission = useCallback(async () => {
-    try {
-      const res = await fetch(
-        `/api/extensions/ext/skatteverket/agi/status?period=${period}`,
-      )
-      if (res.ok) {
-        const json = await res.json()
-        setSubmission(json.data ?? null)
-      }
-    } catch {
-      // ignore
-    }
-  }, [period])
-
   useEffect(() => {
     fetchStatus()
-    fetchSubmission()
-  }, [fetchStatus, fetchSubmission])
+  }, [fetchStatus])
+
+  // Handle of the OAuth tab opened by handleConnect: used to verify the
+  // sender identity of incoming postMessages and to detect abandonment.
+  const popupRef = useRef<Window | null>(null)
+  const watchTimerRef = useRef<ReturnType<typeof setInterval> | null>(null)
+  const delayedRefetchRef = useRef<ReturnType<typeof setTimeout> | null>(null)
+
+  const stopWatchingOauthTab = useCallback(() => {
+    if (watchTimerRef.current) {
+      clearInterval(watchTimerRef.current)
+      watchTimerRef.current = null
+    }
+    setConnecting(false)
+  }, [])
+
+  useEffect(() => {
+    return () => {
+      if (watchTimerRef.current) clearInterval(watchTimerRef.current)
+      if (delayedRefetchRef.current) clearTimeout(delayedRefetchRef.current)
+    }
+  }, [])
 
   // Listen for OAuth completion from the BankID popup. When the popup posts
   // back a success/error message we re-fetch status so the panel flips from
@@ -186,27 +245,47 @@ export function AGIPanel(props: AGIPanelProps) {
   useEffect(() => {
     function handleMessage(event: MessageEvent) {
       if (event.origin !== window.location.origin) return
+      // Source-identity check: only the popup this component opened can
+      // trigger the handler; a window reference cannot be forged by other
+      // same-origin scripts.
+      if (!popupRef.current || event.source !== popupRef.current) return
       if (event.data?.type === 'skatteverket-oauth-success') {
+        stopWatchingOauthTab()
         setError(null)
-        setSuccess('Anslutningen mot Skatteverket lyckades.')
+        setSuccess(t('oauth_success'))
         fetchStatus()
+        // Verified success: rebroadcast as an internal DOM event so passive
+        // consumers (e.g. the salary page) can react without trusting raw
+        // postMessage.
+        window.dispatchEvent(new CustomEvent('skatteverket-connection-updated'))
+        // The post-connect refresh (skattekonto sync, AGI settle, token
+        // health) now runs server-side AFTER the callback responds, so the
+        // status fetched above predates it. Refetch once more when it has
+        // plausibly settled so synced data and health flags show up
+        // without a manual reload.
+        if (delayedRefetchRef.current) clearTimeout(delayedRefetchRef.current)
+        delayedRefetchRef.current = setTimeout(() => {
+          fetchStatus()
+          window.dispatchEvent(new CustomEvent('skatteverket-connection-updated'))
+        }, 15_000)
       } else if (event.data?.type === 'skatteverket-oauth-error') {
+        stopWatchingOauthTab()
         const reason =
           typeof event.data.reason === 'string' && event.data.reason
             ? event.data.reason
-            : 'OAuth-anslutningen misslyckades. Försök igen.'
+            : t('oauth_error_fallback')
         setError(reason)
       }
     }
     window.addEventListener('message', handleMessage)
     return () => window.removeEventListener('message', handleMessage)
-  }, [fetchStatus])
+  }, [fetchStatus, stopWatchingOauthTab, t])
 
   // Drop a stale "AGI-XML saknas" error once the run's AGI is (re)generated.
   // That error is set when "Skicka in underlag" runs before the XML exists; if
   // the file is then generated out-of-band (MCP, the download button, another
   // tab) the parent refreshes `agiGeneratedAt` and this clears the now-wrong
-  // message without forcing a full reload — mirroring the session-expired
+  // message without forcing a full reload, mirroring the session-expired
   // self-heal in fetchStatus above.
   useEffect(() => {
     if (!agiGeneratedAt) return
@@ -214,6 +293,20 @@ export function AGIPanel(props: AGIPanelProps) {
       prev && /agi-xml saknas|inte genererats/i.test(prev) ? null : prev,
     )
   }, [agiGeneratedAt])
+
+  // Loud success when the filing completes: a poll (live timers, tab refocus,
+  // or the parent's refresh) flips isSigned while the user is on the page.
+  // The ref starts null so an already-signed run doesn't toast on mount.
+  const prevSignedRef = useRef<boolean | null>(null)
+  useEffect(() => {
+    if (prevSignedRef.current === false && isSigned) {
+      toast({
+        title: t('toast_signed_title'),
+        description: t('toast_signed_description', { period: prettyPeriod }),
+      })
+    }
+    prevSignedRef.current = isSigned
+  }, [isSigned, toast, t, prettyPeriod])
 
   // Background kvittens-polling timers (see scheduleKvittensPolls below).
   // Held in a ref so the unmount-cleanup effect can cancel them if the
@@ -230,7 +323,7 @@ export function AGIPanel(props: AGIPanelProps) {
    * Silently ask Skatteverket whether this period's granskningsunderlag has
    * been signed. The kvittenser handler stamps salary_runs.agi_submitted_at
    * and flips the local submission state to 'signed' the instant it sees a
-   * uuidKvittens — so a positive result transitions the panel out of
+   * uuidKvittens, so a positive result transitions the panel out of
    * awaiting_signing on its own (the action buttons then disappear via the
    * isSigned gate). Returns true iff a signed kvittens was observed. No-ops
    * (returns false) until we have the arbetsgivare id.
@@ -247,23 +340,23 @@ export function AGIPanel(props: AGIPanelProps) {
       if (!res.ok) return false
       const json = await res.json()
       const signed = !!json.data?.kvittenser?.[0]?.uuidKvittens
-      await fetchSubmission()
+      onRefreshSubmission()
       if (signed) {
         // Replace any lingering "Granskningsunderlag klart…" / stale error
         // with an unambiguous confirmation. Mirrors handleCheckSubmitted.
         setError(null)
-        setSuccess('AGI har signerats och lämnats in.')
+        setSuccess(t('signed_success'))
         onChange?.()
       }
       return signed
     } catch {
       return false
     }
-  }, [arbetsgivare, period, fetchSubmission, onChange])
+  }, [arbetsgivare, period, onRefreshSubmission, onChange, t])
 
   /**
    * Background-poll /agi/kvittenser at 30s, 2 min, and 5 min after the user
-   * receives a signing link — a timer-based fallback to the focus-driven
+   * receives a signing link: a timer-based fallback to the focus-driven
    * auto-detect below. The kvittenser handler stamps salary_runs.agi_submitted_at
    * when it observes a uuidKvittens, critical for the audit trail (BFL 5 kap /
    * BFNAR 2013:2): a NULL agi_submitted_at after a real filing would
@@ -274,11 +367,11 @@ export function AGIPanel(props: AGIPanelProps) {
     kvittensTimers.current = []
 
     const poll = async () => {
-      // checkKvittens is silent on failure — the "Hämta kvittens" button
+      // checkKvittens is silent on failure: the "Hämta kvittens" button
       // remains the explicit recovery path.
       const signed = await checkKvittens()
       if (signed) {
-        // Cancel any remaining timers — the kvittens has been recorded
+        // Cancel any remaining timers: the kvittens has been recorded
         // server-side and further polls are wasted requests.
         for (const t of kvittensTimers.current) clearTimeout(t)
         kvittensTimers.current = []
@@ -294,9 +387,9 @@ export function AGIPanel(props: AGIPanelProps) {
   // without the user having to click "Hämta kvittens". While we sit in
   // awaiting_signing the user has typically opened the signing link (which
   // opens a new tab), signed on Skatteverket's site, and come back. We re-check
-  // the kvittens (a) once on entering awaiting_signing — covering a reload
-  // after signing — and (b) whenever the tab regains focus — covering the
-  // sign-in-the-other-tab-then-return flow. A found kvittens flips the local
+  // the kvittens (a) once on entering awaiting_signing (covering a reload
+  // after signing) and (b) whenever the tab regains focus (covering the
+  // sign-in-the-other-tab-then-return flow). A found kvittens flips the local
   // state to 'signed', hiding the signing actions. The ref makes the on-enter
   // check fire once per episode even if checkKvittens's identity churns (its
   // onChange dep is an unmemoized parent callback).
@@ -318,6 +411,9 @@ export function AGIPanel(props: AGIPanelProps) {
   }, [submission?.status, checkKvittens])
 
   const handleDisconnect = useCallback(async () => {
+    // No disconnect while an OAuth tab is in flight: the callback completing
+    // right after the disconnect would silently recreate the tokens.
+    if (connecting) return
     setActionLoading('disconnect')
     setError(null)
     setSuccess(null)
@@ -327,45 +423,54 @@ export function AGIPanel(props: AGIPanelProps) {
       })
       if (!res.ok) {
         const json = await res.json().catch(() => ({}))
-        setError(json.error || `Kunde inte koppla bort (${res.status})`)
+        setError(json.error || t('disconnect_failed_status', { status: res.status }))
         return
       }
-      setSuccess('Anslutningen mot Skatteverket har kopplats bort.')
+      setSuccess(t('disconnect_success'))
       await fetchStatus()
-      await fetchSubmission()
+      onRefreshSubmission()
     } catch (e) {
-      setError(e instanceof Error ? e.message : 'Kunde inte koppla bort')
+      setError(e instanceof Error ? e.message : t('disconnect_failed'))
     } finally {
       setActionLoading(null)
     }
-  }, [fetchStatus, fetchSubmission])
+  }, [connecting, fetchStatus, onRefreshSubmission, t])
 
   const handleConnect = () => {
-    // Open the BankID OAuth flow in a centered popup. The callback page
+    // Open the BankID OAuth flow in a NEW TAB, not a popup. The old 600x750
+    // popup could not fit Skatteverket's consent page: the approve button
+    // sat below the fold and users got stranded mid-consent. A tab gets the
+    // full viewport (and behaves natively on mobile). The callback page
     // detects `window.opener` and posts back a `skatteverket-oauth-success`
-    // (or `-error`) message, then closes itself — see the postMessage
-    // listener below. `return_to` is still passed so the popup-less fallback
-    // path (e.g. popup blockers) lands on the salary run page rather than
-    // the default /reports tab.
+    // (or `-error`) message, then closes itself: see the postMessage
+    // listener below. `return_to` is still passed so the tab-blocked
+    // fallback path lands on the salary run page rather than the default
+    // /reports tab.
     const returnTo = typeof window !== 'undefined'
       ? window.location.pathname + window.location.search
       : ''
     const url = `/api/extensions/ext/skatteverket/authorize${
       returnTo ? `?return_to=${encodeURIComponent(returnTo)}` : ''
     }`
-    const w = 600
-    const h = 750
-    const left = window.screenX + (window.outerWidth - w) / 2
-    const top = window.screenY + (window.outerHeight - h) / 2
-    const popup = window.open(
-      url,
-      'skatteverket-oauth',
-      `width=${w},height=${h},left=${left},top=${top}`,
-    )
-    if (!popup) {
-      // Popup blocked — fall back to a full-page navigation.
+    const tab = window.open(url, '_blank')
+    popupRef.current = tab
+    if (!tab) {
+      // Tab blocked: fall back to a full-page navigation.
       window.location.href = url
+      return
     }
+    setConnecting(true)
+    // Detect abandonment: if the tab goes away without posting a message
+    // (closed manually, stranded on Skatteverket's side), re-enable the
+    // buttons and refresh status. This also fires after a successful
+    // self-close; the extra status fetch is harmless.
+    if (watchTimerRef.current) clearInterval(watchTimerRef.current)
+    watchTimerRef.current = setInterval(() => {
+      if (popupRef.current?.closed) {
+        stopWatchingOauthTab()
+        fetchStatus()
+      }
+    }, 1000)
   }
 
   /**
@@ -401,11 +506,29 @@ export function AGIPanel(props: AGIPanelProps) {
   }
 
   /**
-   * Step 1: POST the stored XML underlag, then poll kontrollresultat until
-   * status flips out of PROCESSING. Skatteverket's spec says polling is
-   * usually instantaneous, but we cap at 8 attempts × 1s to be safe.
+   * The XML must exist in agi_declarations before anything can be submitted.
+   * The internal xml route both generates and persists it (and stamps
+   * agi_generated_at); the response body, the downloadable file itself, is
+   * discarded here: "Ladda ner AGI-fil" remains the way to get a copy.
+   */
+  async function ensureAgiGenerated(): Promise<boolean> {
+    if (agiGeneratedAt) return true
+    const res = await fetch(`/api/salary/runs/${salaryRunId}/agi/xml`)
+    if (!res.ok) {
+      const data = await res.json().catch(() => ({}))
+      setError(errText(data) || t('xml_generate_failed'))
+      return false
+    }
+    onChange?.() // parent refetches the run so agiGeneratedAt flips
+    return true
+  }
+
+  /**
+   * POST the stored XML underlag, then poll kontrollresultat until status
+   * flips out of PROCESSING. Skatteverket's spec says polling is usually
+   * instantaneous, but we cap at 8 attempts × 1s to be safe.
    *
-   * On DONE_SUCCESS the underlag is auto-persisted by SKV — no /spara call.
+   * On DONE_SUCCESS the underlag is auto-persisted by SKV: no /spara call.
    * Calling /spara when there are no errors returns 400 felkod 20
    * ("Inlämningen är redan sparad/borttagen eller innehöll inga felaktiga
    * underlag") because /spara is specifically for re-persisting rejected
@@ -414,10 +537,154 @@ export function AGIPanel(props: AGIPanelProps) {
    *
    * On DONE_REJECTED we surface the validation findings; the user can still
    * choose to save (so they can fix it in Mina Sidor) or abort.
+   *
+   * Failures surface via setError/setKontroller and return false. Shared by
+   * the one-click chain and the advanced "Skicka in underlag" button;
+   * `onKontrollPhase` lets the chain advance its stepper when polling starts.
    */
+  async function runSubmitUnderlag(onKontrollPhase?: () => void): Promise<boolean> {
+    setKontroller([])
+    const submitRes = await fetch('/api/extensions/ext/skatteverket/agi/submit', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ salaryRunId }),
+    })
+    const submitJson = await submitRes.json()
+    if (!submitRes.ok || submitJson.error) {
+      setError(submitJson.error || t('submit_failed_status', { status: submitRes.status }))
+      return false
+    }
+    const inlamningId = submitJson.data?.inlamningId as number | undefined
+    if (!inlamningId) {
+      setError(t('submit_missing_id'))
+      return false
+    }
+
+    // Poll kontrollresultat until DONE_*
+    onKontrollPhase?.()
+    let kr: Kontrollresultat | undefined
+    for (let attempt = 0; attempt < 8; attempt++) {
+      const krRes = await fetch(
+        `/api/extensions/ext/skatteverket/agi/kontrollresultat?inlamningId=${inlamningId}`,
+      )
+      const krJson = await krRes.json()
+      if (!krRes.ok || krJson.error) {
+        setError(krJson.error || t('kontrollresultat_failed_status', { status: krRes.status }))
+        return false
+      }
+      kr = krJson.data as Kontrollresultat
+      if (kr.status !== 'PROCESSING') break
+      await new Promise(r => setTimeout(r, 1000))
+    }
+    if (!kr || kr.status === 'PROCESSING') {
+      setError(t('still_processing'))
+      return false
+    }
+
+    const findings = extractFindings(kr)
+    setKontroller(findings)
+
+    if (kr.status === 'DONE_SUCCESS') return true
+    if (kr.status === 'DONE_REJECTED') {
+      setError(t('underlag_rejected_error', { count: findings.filter(f => f.status === 'STOPP').length }))
+    } else {
+      setError(t('underlag_failed'))
+    }
+    return false
+  }
+
+  /**
+   * skapaGranskningsunderlag: returns the Mina Sidor deep-link the user opens
+   * to sign with BankID. Defaults to `lasPeriod=true` so the period is locked
+   * while the signing window is open. Returns the link on success ('' when
+   * the response carried none: the signing-link card renders it after the
+   * submission refresh) and null on failure (error already surfaced).
+   */
+  async function runCreateSigningLink(): Promise<string | null> {
+    const res = await fetch(
+      `/api/extensions/ext/skatteverket/agi/granskningsunderlag?arbetsgivare=${encodeURIComponent(arbetsgivare)}&period=${period}`,
+      { method: 'POST' },
+    )
+    const json = await res.json()
+    if (!res.ok || json.error) {
+      setError(json.error || t('signing_link_failed_status', { status: res.status }))
+      return null
+    }
+    if (json.data?.tillstand === 'INCORRECT_DATA') {
+      setError(t('incorrect_data_error', { message: json.data.meddelande || t('incorrect_data_fallback') }))
+      return null
+    }
+    // The user typically opens the link, signs in Mina Sidor, then returns
+    // later (or never). Auto-poll so we capture the kvittens (and stamp
+    // agi_submitted_at) without forcing the user to click "Hämta kvittens".
+    scheduleKvittensPolls()
+    return typeof json.data?.link === 'string' ? json.data.link : ''
+  }
+
+  /**
+   * One-click filing: generate (if missing) → POST underlag → poll kontroll →
+   * create signing link → hand over to BankID signing in Mina Sidor.
+   *
+   * The signing link opens in a tab we open synchronously at click time:
+   * window.open after the async chain would be popup-blocked. On failure the
+   * placeholder tab is closed and the error renders in the panel; if the
+   * popup was blocked outright, the signing-link card (rendered from the
+   * refreshed submission state) is the fallback path.
+   */
+  const handleSubmitChain = async () => {
+    setActionLoading('chain')
+    setError(null)
+    setSuccess(null)
+    let signingTab: Window | null = null
+    try {
+      signingTab = window.open('', '_blank')
+      if (signingTab) {
+        signingTab.document.title = t('chain_tab_title')
+        signingTab.document.body.textContent = t('chain_tab_body')
+      }
+    } catch {
+      signingTab = null
+    }
+    try {
+      setChain({ current: 'generate', failed: false, done: false })
+      if (!(await ensureAgiGenerated())) throw new ChainFailed()
+
+      setChain({ current: 'submit', failed: false, done: false })
+      const submitted = await runSubmitUnderlag(() =>
+        setChain({ current: 'kontroll', failed: false, done: false }),
+      )
+      if (!submitted) throw new ChainFailed()
+
+      setChain({ current: 'link', failed: false, done: false })
+      const link = await runCreateSigningLink()
+      if (link === null) throw new ChainFailed()
+
+      setChain({ current: 'link', failed: false, done: true })
+      setSuccess(t('chain_ready_to_sign'))
+      if (signingTab && link) {
+        signingTab.location.replace(link)
+        signingTab = null // handed over to Skatteverket: don't close it below
+      } else {
+        signingTab?.close()
+        signingTab = null
+      }
+      onRefreshSubmission()
+      onChange?.()
+    } catch (e) {
+      signingTab?.close()
+      setChain(prev => (prev ? { ...prev, failed: true } : prev))
+      if (!(e instanceof ChainFailed)) {
+        setError(e instanceof Error ? e.message : t('submit_failed'))
+      }
+      onRefreshSubmission()
+    } finally {
+      setActionLoading(null)
+    }
+  }
+
   // Always-free: generate + download the AGI XML so the user can file manually
   // in Skatteverket's e-service. AGI is a mandatory statutory filing, so this
-  // path must never be paywalled — only the direct API submission below is paid.
+  // path must never be paywalled: only the direct API submission is paid.
   const handleDownloadXml = async () => {
     setActionLoading('download')
     setError(null)
@@ -425,7 +692,7 @@ export function AGIPanel(props: AGIPanelProps) {
       const res = await fetch(`/api/salary/runs/${salaryRunId}/agi/xml`)
       if (!res.ok) {
         const data = await res.json().catch(() => ({}))
-        throw new Error(data.error || 'Kunde inte generera AGI-filen')
+        throw new Error(errText(data) || t('xml_generate_failed'))
       }
       const blob = await res.blob()
       const url = URL.createObjectURL(blob)
@@ -438,109 +705,41 @@ export function AGIPanel(props: AGIPanelProps) {
       URL.revokeObjectURL(url)
       onChange?.()
     } catch (e) {
-      setError(e instanceof Error ? e.message : 'Kunde inte ladda ner AGI-filen')
+      setError(e instanceof Error ? e.message : t('xml_download_failed'))
     } finally {
       setActionLoading(null)
     }
   }
 
+  /** Advanced/recovery variant: submit the underlag without continuing the chain. */
   const handleSubmit = async () => {
     setActionLoading('submit')
     setError(null)
     setSuccess(null)
-    setKontroller([])
     try {
-      const submitRes = await fetch('/api/extensions/ext/skatteverket/agi/submit', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ salaryRunId }),
-      })
-      const submitJson = await submitRes.json()
-      if (!submitRes.ok || submitJson.error) {
-        setError(submitJson.error || `Inlämning misslyckades (${submitRes.status})`)
-        return
-      }
-      const inlamningId = submitJson.data?.inlamningId as number | undefined
-      if (!inlamningId) {
-        setError('Inlämningssvar saknar inlamningId')
-        return
-      }
-
-      // Poll kontrollresultat until DONE_*
-      let kr: Kontrollresultat | undefined
-      for (let attempt = 0; attempt < 8; attempt++) {
-        const krRes = await fetch(
-          `/api/extensions/ext/skatteverket/agi/kontrollresultat?inlamningId=${inlamningId}`,
-        )
-        const krJson = await krRes.json()
-        if (!krRes.ok || krJson.error) {
-          setError(krJson.error || `Kontrollresultat misslyckades (${krRes.status})`)
-          return
-        }
-        kr = krJson.data as Kontrollresultat
-        if (kr.status !== 'PROCESSING') break
-        await new Promise(r => setTimeout(r, 1000))
-      }
-      if (!kr || kr.status === 'PROCESSING') {
-        setError('Skatteverket bearbetar fortfarande underlaget — försök igen om en stund.')
-        return
-      }
-
-      const findings = extractFindings(kr)
-      setKontroller(findings)
-
-      if (kr.status === 'DONE_SUCCESS') {
-        setSuccess(
-          'Underlag accepterat hos Skatteverket. Klicka "Skapa signeringslänk" ' +
-          'för att gå vidare till BankID-signering i Mina Sidor.',
-        )
-      } else if (kr.status === 'DONE_REJECTED') {
-        setError(`Underlaget innehåller ${findings.filter(f => f.status === 'STOPP').length} stoppande fel. Åtgärda och skicka igen.`)
-      } else {
-        setError('Skatteverket avvisade underlaget (DONE_FAILED).')
-      }
-
-      await fetchSubmission()
+      if (!(await ensureAgiGenerated())) return
+      const ok = await runSubmitUnderlag()
+      if (ok) setSuccess(t('underlag_accepted'))
+      onRefreshSubmission()
       onChange?.()
     } catch (e) {
-      setError(e instanceof Error ? e.message : 'Kunde inte skicka AGI')
+      setError(e instanceof Error ? e.message : t('submit_failed'))
     } finally {
       setActionLoading(null)
     }
   }
 
-  /**
-   * Step 2: skapaGranskningsunderlag — returns the Mina Sidor deep-link the
-   * user opens to sign with BankID. Defaults to `lasPeriod=true` so the
-   * period is locked while the signing window is open.
-   */
+  /** Advanced/recovery variant: create the signing link on its own. */
   const handleCreateSigningLink = async () => {
     setActionLoading('granskning')
     setError(null)
     setSuccess(null)
     try {
-      const res = await fetch(
-        `/api/extensions/ext/skatteverket/agi/granskningsunderlag?arbetsgivare=${encodeURIComponent(arbetsgivare)}&period=${period}`,
-        { method: 'POST' },
-      )
-      const json = await res.json()
-      if (!res.ok || json.error) {
-        setError(json.error || `Kunde inte skapa granskningsunderlag (${res.status})`)
-        return
-      }
-      if (json.data?.tillstand === 'INCORRECT_DATA') {
-        setError(`${json.data.meddelande || 'Felaktiga underlag finns'} — öppna länken för felrapport.`)
-      } else {
-        setSuccess('Granskningsunderlag klart. Öppna signeringslänken för att signera med BankID.')
-        // The user typically opens the link, signs in Mina Sidor, then
-        // returns later (or never). Auto-poll so we capture the kvittens
-        // (and stamp agi_submitted_at) without forcing the user to come
-        // back and click "Hämta kvittens".
-        scheduleKvittensPolls()
-      }
-      await fetchSubmission()
+      const link = await runCreateSigningLink()
+      if (link !== null) setSuccess(t('signing_link_ready'))
+      onRefreshSubmission()
     } catch (e) {
-      setError(e instanceof Error ? e.message : 'Kunde inte skapa granskningsunderlag')
+      setError(e instanceof Error ? e.message : t('signing_link_failed'))
     } finally {
       setActionLoading(null)
     }
@@ -557,20 +756,20 @@ export function AGIPanel(props: AGIPanelProps) {
       )
       const json = await res.json()
       if (!res.ok || json.error) {
-        setError(json.error || `Kunde inte låsa upp (${res.status})`)
+        setError(json.error || t('unlock_failed_status', { status: res.status }))
         return
       }
-      setSuccess('AGI har låsts upp')
-      await fetchSubmission()
+      setSuccess(t('unlock_success'))
+      onRefreshSubmission()
     } catch (e) {
-      setError(e instanceof Error ? e.message : 'Kunde inte låsa upp')
+      setError(e instanceof Error ? e.message : t('unlock_failed'))
     } finally {
       setActionLoading(null)
     }
   }
 
   /**
-   * Step 3 (post-signing): poll /agi/kvittenser to detect that the user has
+   * Post-signing recovery: poll /agi/kvittenser to detect that the user has
    * signed in Mina Sidor. Once a kvittens turns up, the index.ts handler
    * mirrors it onto agi_declarations and flips the local submission state
    * to 'signed'.
@@ -585,19 +784,19 @@ export function AGIPanel(props: AGIPanelProps) {
       )
       const json = await res.json()
       if (!res.ok || json.error) {
-        setError(json.error || 'Kunde inte hämta kvittenser')
+        setError(json.error || t('kvittens_fetch_failed'))
         return
       }
       const kvittens = json.data?.kvittenser?.[0]
       if (kvittens?.uuidKvittens) {
-        setSuccess('AGI har signerats och lämnats in.')
+        setSuccess(t('signed_success'))
       } else {
-        setSuccess('Ingen signerad kvittens hittades än för perioden.')
+        setSuccess(t('no_kvittens_yet'))
       }
-      await fetchSubmission()
+      onRefreshSubmission()
       onChange?.()
     } catch (e) {
-      setError(e instanceof Error ? e.message : 'Kunde inte kontrollera status')
+      setError(e instanceof Error ? e.message : t('check_status_failed'))
     } finally {
       setActionLoading(null)
     }
@@ -609,15 +808,15 @@ export function AGIPanel(props: AGIPanelProps) {
     return (
       <Card>
         <CardHeader>
-          <CardTitle className="text-base">Arbetsgivardeklaration (AGI)</CardTitle>
+          <CardTitle className="text-base">{t('title')}</CardTitle>
         </CardHeader>
         <CardContent className="space-y-2 text-sm text-muted-foreground">
           <div className="flex items-start gap-2">
             <ShieldAlert className="mt-0.5 h-4 w-4 shrink-0" />
             <p>
-              Skatteverket-integrationen är inaktiverad i denna miljö. Aktivera
+              {t('disabled_before')}
               <code className="mx-1 rounded bg-muted px-1 py-0.5 text-xs">SKATTEVERKET_ENABLED</code>
-              för att skicka AGI direkt till Skatteverket.
+              {t('disabled_after')}
             </p>
           </div>
         </CardContent>
@@ -629,10 +828,10 @@ export function AGIPanel(props: AGIPanelProps) {
     return (
       <Card>
         <CardHeader>
-          <CardTitle className="text-base">Arbetsgivardeklaration (AGI)</CardTitle>
+          <CardTitle className="text-base">{t('title')}</CardTitle>
         </CardHeader>
         <CardContent className="text-sm text-muted-foreground">
-          <Loader2 className="mr-2 inline h-4 w-4 animate-spin" /> Hämtar Skatteverket-status...
+          <Loader2 className="mr-2 inline h-4 w-4 animate-spin" /> {t('loading_status')}
         </CardContent>
       </Card>
     )
@@ -642,16 +841,16 @@ export function AGIPanel(props: AGIPanelProps) {
     return (
       <Card>
         <CardHeader>
-          <CardTitle className="text-base">Arbetsgivardeklaration (AGI)</CardTitle>
+          <CardTitle className="text-base">{t('title')}</CardTitle>
         </CardHeader>
         <CardContent className="space-y-3">
           <p className="text-sm text-muted-foreground">
-            Anslut till Skatteverket med BankID för att skicka AGI direkt från accounted.
+            {t('connect_description')}
           </p>
           {!readOnly && (
-            <Button onClick={handleConnect}>
+            <Button onClick={handleConnect} disabled={connecting}>
               <Link2 className="mr-2 h-4 w-4" />
-              Anslut med BankID
+              {connecting ? t('connect_waiting') : t('connect_button')}
             </Button>
           )}
         </CardContent>
@@ -659,96 +858,128 @@ export function AGIPanel(props: AGIPanelProps) {
     )
   }
 
-  const subState = submission?.status
-  const awaitingSigning = subState === 'awaiting_signing'
-  const underlagSubmitted = subState === 'underlag_submitted'
-  const underlagRejected = subState === 'underlag_rejected'
-  const isSigned = subState === 'signed' || !!agiSubmittedAt
-  // The submission state is keyed by PERIOD; AGI generation is keyed by RUN.
-  // If the run's AGI was (re)generated AFTER this signing draft was created,
-  // the locked underlag at Skatteverket reflects superseded figures and must
-  // not be signed — surface a warning and steer the user to unlock + resubmit
-  // rather than presenting it as ready to sign (avoids filing stale amounts).
-  const draftUpdatedAt = submission?.updatedAt ? new Date(submission.updatedAt) : null
-  const draftIsStale =
-    awaitingSigning &&
-    !!agiGeneratedAt &&
-    !!draftUpdatedAt &&
-    !Number.isNaN(draftUpdatedAt.getTime()) &&
-    new Date(agiGeneratedAt).getTime() > draftUpdatedAt.getTime()
   // Tokens issued before the agd scope was added to DEFAULT_SCOPES will
-  // 403 with invalid_scope at submission time — surface that proactively
+  // 403 with invalid_scope at submission time: surface that proactively
   // so the user reconnects before hitting the deadline rather than at it.
   const missingAgdScope =
     typeof status?.scope === 'string' &&
     !status.scope.split(/\s+/).filter(Boolean).includes('agd')
 
+  // Recovery states expose the advanced actions on their own: the stale-draft
+  // and error-report guidance below reference them by name.
+  const forcedAdvanced = draftIsStale || underlagRejected
+  const advancedOpen = showAdvanced || forcedAdvanced
+
+  const signedAtRaw = submission?.signeradTid ?? agiSubmittedAt ?? null
+  const signedAtText = signedAtRaw ? new Date(signedAtRaw).toLocaleString('sv-SE') : null
+
+  const chainStepState = (step: ChainStep): 'done' | 'running' | 'failed' | 'upcoming' => {
+    if (!chain) return 'upcoming'
+    const idx = CHAIN_STEPS.indexOf(step)
+    const currentIdx = CHAIN_STEPS.indexOf(chain.current)
+    if (idx < currentIdx || (idx === currentIdx && chain.done)) return 'done'
+    if (idx === currentIdx) return chain.failed ? 'failed' : 'running'
+    return 'upcoming'
+  }
+
   return (
     <Card>
       <CardHeader>
         <CardTitle className="flex items-center justify-between text-base">
-          <span>Arbetsgivardeklaration (AGI)</span>
+          <span>{t('title')}</span>
           <span className="flex items-center gap-2 text-xs font-normal text-muted-foreground">
             <span className="flex items-center gap-1">
               <CheckCircle2 className="h-3.5 w-3.5 text-success" />
-              Ansluten
+              {t('connected')}
             </span>
             {!readOnly && (
               <button
                 type="button"
                 onClick={handleDisconnect}
-                disabled={actionLoading === 'disconnect'}
+                disabled={actionLoading === 'disconnect' || connecting}
                 className="inline-flex items-center gap-1 rounded border border-border px-1.5 py-0.5 text-[11px] font-normal text-muted-foreground transition-colors hover:border-destructive/50 hover:text-destructive disabled:cursor-not-allowed disabled:opacity-50"
-                title="Koppla bort anslutningen mot Skatteverket"
+                title={t('disconnect_title')}
               >
                 {actionLoading === 'disconnect' ? (
                   <Loader2 className="h-3 w-3 animate-spin" />
                 ) : (
                   <PlugZap className="h-3 w-3" />
                 )}
-                Koppla bort
+                {t('disconnect_button')}
               </button>
             )}
           </span>
         </CardTitle>
       </CardHeader>
       <CardContent className="space-y-4">
-        {/* Expired-session banner — the token row exists (so status.connected
+        {/* Filed: the terminal state deserves more than a gray status row.
+            Kvittensnummer + signature metadata come from the submission
+            record; a run stamped only via agi_submitted_at (e.g. cron
+            reconciliation with an evicted cache) still gets the card. */}
+        {isSigned && (
+          <div className="rounded-md border border-border bg-muted/30 p-4">
+            <div className="flex items-start gap-3">
+              <CheckCircle2 className="mt-0.5 h-5 w-5 shrink-0 text-success" />
+              <div className="space-y-1">
+                <p className="text-sm font-medium">
+                  {t('success_card_title', { period: prettyPeriod })}
+                </p>
+                {submission?.kvittensnummer && (
+                  <p className="text-sm text-muted-foreground tabular-nums">
+                    {t('success_card_kvittens', { kvittens: submission.kvittensnummer })}
+                  </p>
+                )}
+                {(submission?.signeradAv || signedAtText) && (
+                  <p className="text-sm text-muted-foreground">
+                    {submission?.signeradAv
+                      ? signedAtText
+                        ? t('success_card_signed_by_at', {
+                            name: submission.signeradAv,
+                            date: signedAtText,
+                          })
+                        : t('success_card_signed_by', { name: submission.signeradAv })
+                      : t('success_card_signed_at', { date: signedAtText ?? '' })}
+                  </p>
+                )}
+              </div>
+            </div>
+          </div>
+        )}
+
+        {/* Expired-session banner: the token row exists (so status.connected
             is true) but the access token is past expiry and either has no
             refresh token or has burned through its 10-refresh budget. The
             only fix is a fresh BankID round-trip. */}
         {(status?.expired === true || status?.canRefresh === false) && !readOnly && (
-          <div className="rounded-md border border-amber-300 bg-amber-50 p-3 dark:border-amber-900/40 dark:bg-amber-900/20">
-            <p className="text-sm font-medium">Anslutningen mot Skatteverket har gått ut</p>
+          <div className="rounded-md border border-border bg-muted/30 p-3">
+            <p className="text-sm font-medium">{t('expired_banner_title')}</p>
             <p className="mt-1 text-xs text-muted-foreground">
-              Logga in med BankID igen för att kunna skicka AGI.
+              {t('expired_banner_description')}
             </p>
-            <Button size="sm" variant="outline" className="mt-2" onClick={handleConnect}>
+            <Button size="sm" variant="outline" className="mt-2" onClick={handleConnect} disabled={connecting}>
               <Link2 className="mr-1.5 h-3.5 w-3.5" />
-              Återanslut med BankID
+              {connecting ? t('connect_waiting') : t('reconnect_button')}
             </Button>
           </div>
         )}
 
-        {/* Missing-scope banner — proactive nudge before the user hits a
+        {/* Missing-scope banner: proactive nudge before the user hits a
             403 invalid_scope at submission time. The agd scope was added
             after some users had already connected, so their stored token
             grants moms/skattekonto but not AGI. */}
         {missingAgdScope && !readOnly && (
-          <div className="rounded-md border border-amber-300 bg-amber-50 p-3 dark:border-amber-900/40 dark:bg-amber-900/20">
+          <div className="rounded-md border border-border bg-muted/30 p-3">
             <p className="text-sm font-medium">
-              Anslutningen mot Skatteverket saknar behörighet för Arbetsgivardeklaration
+              {t('missing_scope_title')}
             </p>
             <p className="mt-1 text-xs text-muted-foreground">
-              Din anslutning utfärdades innan AGI-stödet aktiverades. Koppla
-              bort och anslut igen via Inställningar → Skatt för att
-              kunna skicka AGI direkt.
+              {t('missing_scope_description')}
             </p>
             <a
               href="/settings/tax"
               className="mt-2 inline-flex items-center gap-1 text-sm font-medium hover:underline"
             >
-              Öppna inställningar <ExternalLink className="h-3.5 w-3.5" />
+              {t('open_settings')} <ExternalLink className="h-3.5 w-3.5" />
             </a>
           </div>
         )}
@@ -757,76 +988,81 @@ export function AGIPanel(props: AGIPanelProps) {
         <div className="space-y-1.5 text-sm">
           <StatusRow
             ok={!!agiGeneratedAt}
-            okText={agiGeneratedAt ? `AGI-fil genererad ${new Date(agiGeneratedAt).toLocaleString('sv-SE')}` : ''}
-            pendingText="AGI-fil har inte genererats ännu."
+            okText={agiGeneratedAt ? t('file_generated', { date: new Date(agiGeneratedAt).toLocaleString('sv-SE') }) : ''}
+            pendingText={t('file_not_generated')}
           />
           <StatusRow
             ok={isSigned}
             okText={
               submission?.kvittensnummer
-                ? `Skickad till Skatteverket — kvittens ${submission.kvittensnummer}`
+                ? t('submitted_with_kvittens', { kvittens: submission.kvittensnummer })
                 : agiSubmittedAt
-                  ? `Skickad till Skatteverket ${new Date(agiSubmittedAt).toLocaleString('sv-SE')}`
-                  : 'Skickad'
+                  ? t('submitted_at', { date: new Date(agiSubmittedAt).toLocaleString('sv-SE') })
+                  : t('submitted')
             }
             pendingText={
               awaitingSigning
                 ? draftIsStale
-                  ? 'Ett signeringsutkast finns hos Skatteverket men är inaktuellt — lås upp och skicka in underlaget på nytt.'
-                  : 'Granskningsunderlag klart — väntar på BankID-signatur i Mina Sidor.'
+                  ? t('pending_stale_draft')
+                  : t('pending_awaiting_signature')
                 : underlagSubmitted
-                  ? 'Underlag inläst hos Skatteverket. Skapa granskningsunderlag för att gå vidare till signering.'
-                  : 'Inte skickad till Skatteverket ännu. Deadline: 12:e i månaden efter utbetalning (17:e i januari/augusti för arbetsgivare vars sammanlagda lönesumma understiger 40 MSEK per år).'
+                  ? t('pending_underlag_submitted')
+                  : t('pending_not_submitted')
             }
           />
         </div>
 
-        {/* Signing link — only shown for the happy path. The link in
+        {/* Signing link: only shown for the happy path. The link in
             `signeringslank` is also reused by the INCORRECT_DATA branch
             below to surface a felrapport URL, which deserves a distinct
             treatment so the user understands they must fix errors before
             BankID signing is even possible. */}
         {submission?.signeringslank && awaitingSigning && !draftIsStale && (
-          <div className="rounded-md border border-amber-200 bg-amber-50 p-3 dark:border-amber-900/40 dark:bg-amber-900/20">
-            <p className="text-sm font-medium">Utkastet är låst och redo att signeras</p>
+          <div className="rounded-md border border-border bg-muted/30 p-3">
+            <p className="text-sm font-medium">
+              <InfoTooltip variant="help" content={t('granskningsunderlag_gloss')}>
+                {t('draft_locked_title')}
+              </InfoTooltip>
+            </p>
             <p className="mt-0.5 text-xs text-muted-foreground">
-              Öppna länken nedan och signera med BankID på Skatteverkets sida.
+              {t('draft_locked_description')}
             </p>
             <a
               href={submission.signeringslank}
               target="_blank"
               rel="noreferrer"
-              className="mt-2 inline-flex items-center gap-1 text-sm font-medium text-amber-900 hover:underline dark:text-amber-200"
+              className="mt-2 inline-flex items-center gap-1 text-sm font-medium hover:underline"
             >
-              Öppna signeringslänk <ExternalLink className="h-3.5 w-3.5" />
+              {t('open_signing_link')} <ExternalLink className="h-3.5 w-3.5" />
             </a>
           </div>
         )}
 
-        {/* Stale-draft guard — the signing draft at Skatteverket predates the
+        {/* Stale-draft guard: the signing draft at Skatteverket predates the
             current run's AGI generation, so it carries superseded figures.
             We deliberately do NOT surface "Öppna signeringslänk" here: signing
             it would file the old amounts. The "Lås upp" button below releases
             the SKV lock; the user then re-submits the freshly generated XML. */}
         {awaitingSigning && draftIsStale && (
-          <div className="rounded-md border border-amber-300 bg-amber-50 p-3 dark:border-amber-900/40 dark:bg-amber-900/20">
-            <p className="text-sm font-medium">Signeringsutkastet är inaktuellt</p>
+          <div className="rounded-md border border-border bg-muted/30 p-3">
+            <p className="text-sm font-medium">{t('stale_draft_title')}</p>
             <p className="mt-0.5 text-xs text-muted-foreground">
-              AGI:n genererades om{' '}
-              {agiGeneratedAt ? new Date(agiGeneratedAt).toLocaleString('sv-SE') : ''}{' '}
-              efter att det här signeringsutkastet skapades
-              {submission?.updatedAt
-                ? ` (${new Date(submission.updatedAt).toLocaleString('sv-SE')})`
-                : ''}
-              . Utkastet hos Skatteverket innehåller äldre siffror. Klicka{' '}
-              <span className="font-medium">Lås upp</span> och därefter{' '}
-              <span className="font-medium">Skicka in underlag</span> för att
-              signera rätt belopp.
+              {t('stale_draft_description', {
+                generatedAt: agiGeneratedAt ? new Date(agiGeneratedAt).toLocaleString('sv-SE') : '',
+                draftCreatedAt: submission?.updatedAt
+                  ? ` (${new Date(submission.updatedAt).toLocaleString('sv-SE')})`
+                  : '',
+              })}{' '}
+              {t('stale_draft_click')}{' '}
+              <span className="font-medium">{t('unlock_button')}</span>{' '}
+              {t('stale_draft_then')}{' '}
+              <span className="font-medium">{t('submit_button')}</span>{' '}
+              {t('stale_draft_to_sign')}
             </p>
           </div>
         )}
 
-        {/* INCORRECT_DATA branch — skapaGranskningsunderlag returned 409 with
+        {/* INCORRECT_DATA branch: skapaGranskningsunderlag returned 409 with
             a felrapport link. The user must open the link in Mina Sidor to
             see what's wrong, fix it, and then re-submit. Without this UI the
             link would be permanently unreachable even though the extension
@@ -834,10 +1070,10 @@ export function AGIPanel(props: AGIPanelProps) {
         {submission?.signeringslank && underlagRejected && (
           <div className="rounded-md border border-destructive/40 bg-destructive/5 p-3">
             <p className="text-sm font-medium text-destructive">
-              Felaktiga underlag — granskningsunderlag kunde inte signeras
+              {t('incorrect_data_title')}
             </p>
             <p className="mt-0.5 text-xs text-muted-foreground">
-              {submission.meddelande || 'Skatteverket avvisade underlaget. Öppna felrapporten för detaljer.'}
+              {submission.meddelande || t('incorrect_data_description')}
             </p>
             <a
               href={submission.signeringslank}
@@ -845,18 +1081,18 @@ export function AGIPanel(props: AGIPanelProps) {
               rel="noreferrer"
               className="mt-2 inline-flex items-center gap-1 text-sm font-medium text-destructive hover:underline"
             >
-              Öppna felrapport hos Skatteverket <ExternalLink className="h-3.5 w-3.5" />
+              {t('open_error_report')} <ExternalLink className="h-3.5 w-3.5" />
             </a>
           </div>
         )}
 
         {kontroller.length > 0 && (
-          <div className="space-y-1 rounded-md border bg-muted/30 p-2.5">
+          <div className="space-y-1 rounded-md border bg-muted/30 p-3">
             {kontroller.map((k, i) => (
               <div
                 key={i}
                 className={`flex items-start gap-2 text-xs ${
-                  k.status === 'STOPP' ? 'text-destructive' : 'text-amber-700 dark:text-amber-400'
+                  k.status === 'STOPP' ? 'text-destructive' : 'text-warning'
                 }`}
               >
                 <AlertCircle className="mt-0.5 h-3.5 w-3.5 shrink-0" />
@@ -880,14 +1116,14 @@ export function AGIPanel(props: AGIPanelProps) {
             status?.expired === true ||
             status?.canRefresh === false
           return (
-            <div className="rounded-md bg-destructive/10 p-2.5 text-sm text-destructive">
+            <div className="rounded-md bg-destructive/10 p-3 text-sm text-destructive">
               <AlertCircle className="mr-1 inline h-3.5 w-3.5" />
               {error}
               {sessionExpired && !readOnly && (
                 <div className="mt-2">
-                  <Button size="sm" variant="outline" onClick={handleConnect}>
+                  <Button size="sm" variant="outline" onClick={handleConnect} disabled={connecting}>
                     <Link2 className="mr-1.5 h-3.5 w-3.5" />
-                    Återanslut med BankID
+                    {connecting ? t('connect_waiting') : t('reconnect_button')}
                   </Button>
                 </div>
               )}
@@ -895,98 +1131,152 @@ export function AGIPanel(props: AGIPanelProps) {
           )
         })()}
         {success && !error && (
-          <div className="rounded-md bg-emerald-50 p-2.5 text-sm text-emerald-900 dark:bg-emerald-900/20 dark:text-emerald-300">
-            <CheckCircle2 className="mr-1 inline h-3.5 w-3.5" />
+          <div className="rounded-md border border-border bg-muted/30 p-3 text-sm">
+            <CheckCircle2 className="mr-1 inline h-3.5 w-3.5 text-success" />
             {success}
           </div>
         )}
 
         {!readOnly && !isSigned && (
-          <div className="flex flex-wrap gap-2">
-            <Button
-              size="sm"
-              variant="outline"
-              onClick={handleDownloadXml}
-              disabled={actionLoading === 'download'}
-              title="Ladda ner AGI-filen (XML) för manuell inlämning hos Skatteverket"
-            >
-              {actionLoading === 'download' ? (
-                <Loader2 className="mr-1.5 h-3.5 w-3.5 animate-spin" />
-              ) : (
-                <Download className="mr-1.5 h-3.5 w-3.5" />
+          <div className="space-y-3">
+            {/* Primary path: one click runs the whole filing chain. Hidden
+                while a signing draft is open at SKV (the period is locked,
+                so a resubmission would be refused): the signing-link card
+                above is the CTA then, and the stale-draft recovery goes
+                through the advanced actions per the guidance text. The
+                XML download stays free for manual filing regardless. */}
+            <div className="flex flex-wrap items-center gap-2">
+              {!awaitingSigning && (
+                <Button
+                  onClick={handleSubmitChain}
+                  disabled={actionLoading !== null || !hasSkatteverket}
+                >
+                  {actionLoading === 'chain' ? (
+                    <Loader2 className="mr-2 h-4 w-4 animate-spin" />
+                  ) : (
+                    <Send className="mr-2 h-4 w-4" />
+                  )}
+                  {t('chain_button')}
+                </Button>
               )}
-              Ladda ner AGI-fil
-            </Button>
-            <Button
-              size="sm"
-              variant="outline"
-              onClick={handleSubmit}
-              disabled={actionLoading === 'submit' || !hasSkatteverket}
-              title={
-                !hasSkatteverket
-                  ? 'Inlämning av AGI till Skatteverket ingår i en uppgraderad plan.'
-                  : undefined
-              }
-            >
-              {actionLoading === 'submit' ? (
-                <Loader2 className="mr-1.5 h-3.5 w-3.5 animate-spin" />
-              ) : (
-                <Send className="mr-1.5 h-3.5 w-3.5" />
-              )}
-              Skicka in underlag
-            </Button>
-            <Button
-              size="sm"
-              onClick={handleCreateSigningLink}
-              disabled={actionLoading === 'granskning' || !underlagSubmitted}
-            >
-              {actionLoading === 'granskning' ? (
-                <Loader2 className="mr-1.5 h-3.5 w-3.5 animate-spin" />
-              ) : (
-                <Lock className="mr-1.5 h-3.5 w-3.5" />
-              )}
-              Skapa signeringslänk
-            </Button>
-            <Button
-              size="sm"
-              variant="ghost"
-              onClick={handleCheckSubmitted}
-              disabled={actionLoading === 'check'}
-            >
-              {actionLoading === 'check' ? (
-                <Loader2 className="mr-1.5 h-3.5 w-3.5 animate-spin" />
-              ) : (
-                <Download className="mr-1.5 h-3.5 w-3.5" />
-              )}
-              Hämta kvittens
-            </Button>
-            {awaitingSigning && (
               <Button
                 size="sm"
-                variant="ghost"
-                onClick={handleUnlock}
-                disabled={actionLoading === 'unlock'}
+                variant="outline"
+                onClick={handleDownloadXml}
+                disabled={actionLoading === 'download'}
+                title={t('download_xml_title')}
               >
-                {actionLoading === 'unlock' ? (
+                {actionLoading === 'download' ? (
                   <Loader2 className="mr-1.5 h-3.5 w-3.5 animate-spin" />
                 ) : (
-                  <Unlock className="mr-1.5 h-3.5 w-3.5" />
+                  <Download className="mr-1.5 h-3.5 w-3.5" />
                 )}
-                Lås upp
+                {t('download_xml_button')}
               </Button>
+            </div>
+
+            {chain && (
+              <ol className="space-y-1.5 rounded-md border border-border bg-muted/30 p-3">
+                {CHAIN_STEPS.map(step => {
+                  const state = chainStepState(step)
+                  return (
+                    <li key={step} className="flex items-center gap-2 text-xs">
+                      {state === 'done' ? (
+                        <CheckCircle2 className="h-3.5 w-3.5 shrink-0 text-success" />
+                      ) : state === 'running' ? (
+                        <Loader2 className="h-3.5 w-3.5 shrink-0 animate-spin" />
+                      ) : state === 'failed' ? (
+                        <AlertCircle className="h-3.5 w-3.5 shrink-0 text-destructive" />
+                      ) : (
+                        <Circle className="h-3.5 w-3.5 shrink-0 text-muted-foreground/50" />
+                      )}
+                      <span className={state === 'upcoming' ? 'text-muted-foreground' : ''}>
+                        {t(`chain_step_${step}`)}
+                      </span>
+                    </li>
+                  )
+                })}
+              </ol>
             )}
+
+            {/* Recovery/expert actions: each is one step of the chain above,
+                for resuming after a partial failure. Auto-expanded when a
+                recovery state (stale draft, rejected underlag) references
+                them by name. */}
+            <div>
+              {!forcedAdvanced && (
+                <button
+                  type="button"
+                  onClick={() => setShowAdvanced(v => !v)}
+                  className="text-xs text-muted-foreground transition-colors hover:text-foreground"
+                >
+                  {advancedOpen ? t('advanced_hide') : t('advanced_show')}
+                </button>
+              )}
+              {advancedOpen && (
+                <div className="mt-2 flex flex-wrap gap-2">
+                  <Button
+                    size="sm"
+                    variant="outline"
+                    onClick={handleSubmit}
+                    disabled={actionLoading !== null || !hasSkatteverket}
+                  >
+                    {actionLoading === 'submit' ? (
+                      <Loader2 className="mr-1.5 h-3.5 w-3.5 animate-spin" />
+                    ) : (
+                      <Send className="mr-1.5 h-3.5 w-3.5" />
+                    )}
+                    {t('submit_button')}
+                  </Button>
+                  <Button
+                    size="sm"
+                    variant="outline"
+                    onClick={handleCreateSigningLink}
+                    disabled={actionLoading !== null || !underlagSubmitted}
+                  >
+                    {actionLoading === 'granskning' ? (
+                      <Loader2 className="mr-1.5 h-3.5 w-3.5 animate-spin" />
+                    ) : (
+                      <Lock className="mr-1.5 h-3.5 w-3.5" />
+                    )}
+                    {t('signing_link_button')}
+                  </Button>
+                  <Button
+                    size="sm"
+                    variant="ghost"
+                    onClick={handleCheckSubmitted}
+                    disabled={actionLoading !== null}
+                  >
+                    {actionLoading === 'check' ? (
+                      <Loader2 className="mr-1.5 h-3.5 w-3.5 animate-spin" />
+                    ) : (
+                      <Download className="mr-1.5 h-3.5 w-3.5" />
+                    )}
+                    {t('check_kvittens_button')}
+                  </Button>
+                  {awaitingSigning && (
+                    <Button
+                      size="sm"
+                      variant="ghost"
+                      onClick={handleUnlock}
+                      disabled={actionLoading !== null}
+                    >
+                      {actionLoading === 'unlock' ? (
+                        <Loader2 className="mr-1.5 h-3.5 w-3.5 animate-spin" />
+                      ) : (
+                        <Unlock className="mr-1.5 h-3.5 w-3.5" />
+                      )}
+                      {t('unlock_button')}
+                    </Button>
+                  )}
+                </div>
+              )}
+            </div>
           </div>
         )}
 
         {!readOnly && !isSigned && !hasSkatteverket && (
-          <p className="text-xs text-muted-foreground">
-            Ladda ner AGI-filen ovan och lämna in den manuellt i Skatteverkets
-            e-tjänst — eller{' '}
-            <a href="/settings/billing" className="font-medium underline hover:no-underline">
-              uppgradera
-            </a>{' '}
-            för att skicka in direkt härifrån.
-          </p>
+          <UpgradeNote>{t('upgrade_note')}</UpgradeNote>
         )}
       </CardContent>
     </Card>

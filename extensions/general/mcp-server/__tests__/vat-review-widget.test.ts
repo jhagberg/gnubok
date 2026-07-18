@@ -1,5 +1,5 @@
 /**
- * Tests for the VAT review widget — registration, resource serving,
+ * Tests for the VAT review widget: registration, resource serving,
  * and tool _meta wiring. Does NOT re-test the underlying VAT computation
  * (covered by existing get_vat_report tests); only the widget plumbing.
  */
@@ -19,10 +19,10 @@ vi.mock('@/lib/auth/api-keys', async (importOriginal) => {
     extractBearerToken: vi.fn().mockReturnValue('test-token'),
     validateApiKey: vi.fn().mockResolvedValue({
       userId: 'user-1',
-      companyId: 'company-1',
+      companyId: '11111111-1111-4111-8111-111111111111',
       scopes: ['reports:read'],
     }),
-    // Fully-chainable, awaitable proxy resolving to empty data — satisfies both
+    // Fully-chainable, awaitable proxy resolving to empty data: satisfies both
     // loadAtomsAsSkills (select→eq→eq→order) and computeVatReport (select→eq→in→
     // gte→lte→…) without hand-enumerating each chain.
     createServiceClientNoCookies: vi.fn(() => {
@@ -38,7 +38,27 @@ vi.mock('@/lib/auth/api-keys', async (importOriginal) => {
             },
           },
         )
-      return { from: () => makeChain() }
+      const membershipChain: unknown = new Proxy(
+        {},
+        {
+          get(_t, prop) {
+            if (prop === 'then') {
+              return (resolve: (v: unknown) => void) =>
+                resolve({
+                  data: {
+                    company_id: '11111111-1111-4111-8111-111111111111',
+                    role: 'owner',
+                  },
+                  error: null,
+                })
+            }
+            return () => membershipChain
+          },
+        }
+      )
+      return {
+        from: (table: string) => (table === 'company_members' ? membershipChain : makeChain()),
+      }
     }),
   }
 })
@@ -145,7 +165,7 @@ describe('VAT review widget', () => {
     })
   })
 
-  describe('gnubok_get_vat_report — render_ui merge', () => {
+  describe('gnubok_get_vat_report: render_ui merge', () => {
     it('declares render_ui and points at the vat-review widget', () => {
       const tool = tools.find((t) => t.name === 'gnubok_get_vat_report')!
       expect((tool as { uiResourceUri?: string }).uiResourceUri).toBe('ui://vat-review/app.html')

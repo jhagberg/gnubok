@@ -39,6 +39,11 @@ vi.mock('@/lib/bookkeeping/supplier-invoice-entries', () => ({
     mockCreateSupplierInvoicePrivatelyPaidEntry(...args),
 }))
 
+const mockLinkToJournalEntry = vi.fn()
+vi.mock('@/lib/core/documents/document-service', () => ({
+  linkToJournalEntry: (...args: unknown[]) => mockLinkToJournalEntry(...args),
+}))
+
 import { eventBus } from '@/lib/events'
 
 import { GET, POST } from '../route'
@@ -100,6 +105,20 @@ describe('GET /api/supplier-invoices', () => {
     expect(status).toBe(200)
   })
 
+  it('applies supplier_id filter', async () => {
+    const invoices = [makeSupplierInvoice({ supplier_id: 'supplier-1' })]
+    enqueue({ data: invoices, error: null })
+
+    const request = createMockRequest('/api/supplier-invoices', {
+      searchParams: { status: 'all', supplier_id: 'supplier-1' },
+    })
+    const response = await GET(request)
+    const { status, body } = await parseJsonResponse<{ data: unknown[] }>(response)
+
+    expect(status).toBe(200)
+    expect(body.data).toEqual(invoices)
+  })
+
   it('returns 500 on database error', async () => {
     enqueue({ data: null, error: { message: 'DB error' } })
 
@@ -114,6 +133,7 @@ describe('GET /api/supplier-invoices', () => {
 
 const VALID_UUID = '550e8400-e29b-41d4-a716-446655440000'
 const VALID_UUID_2 = '550e8400-e29b-41d4-a716-446655440001'
+const DOCUMENT_UUID = '550e8400-e29b-41d4-a716-446655440002'
 
 describe('POST /api/supplier-invoices', () => {
   const mockUser = { id: 'user-1', email: 'test@test.se' }
@@ -137,6 +157,33 @@ describe('POST /api/supplier-invoices', () => {
 
     expect(status).toBe(401)
     expect(body).toEqual({ error: 'Unauthorized' })
+  })
+
+  it('returns 400 when vat_rate is percent-shaped (25 instead of 0.25, issue #310)', async () => {
+    const request = createMockRequest('/api/supplier-invoices', {
+      method: 'POST',
+      body: {
+        supplier_id: VALID_UUID,
+        supplier_invoice_number: 'LF-PERCENT',
+        invoice_date: '2024-06-01',
+        due_date: '2024-07-01',
+        items: [
+          // Percent-integer shape: used to be accepted and silently booked
+          // 2500 % VAT (line_total * 25).
+          { description: 'Material', quantity: 1, unit_price: 1000, account_number: '4010', vat_rate: 25 },
+        ],
+      },
+    })
+    const response = await POST(request)
+    const { status, body } = await parseJsonResponse<{
+      type: string
+      errors: Array<{ field: string; message: string }>
+    }>(response)
+
+    expect(status).toBe(400)
+    expect(body.type).toBe('validation_error')
+    expect(body.errors.some((e) => e.field === 'items.0.vat_rate')).toBe(true)
+    expect(mockCreateSupplierInvoiceRegistrationEntry).not.toHaveBeenCalled()
   })
 
   it('returns 404 when supplier not found', async () => {
@@ -205,6 +252,122 @@ describe('POST /api/supplier-invoices', () => {
     expect(body.data).toBeTruthy()
     expect(body.data.registration_journal_entry_id).toBe('je-1')
     expect(mockCreateSupplierInvoiceRegistrationEntry).toHaveBeenCalled()
+  })
+
+  it('registers WITHOUT booking when defer_invoice_booking is on (#967)', async () => {
+    const supplier = makeSupplier({ id: VALID_UUID })
+    const createdInvoice = makeSupplierInvoice({ id: 'si-deferred' })
+
+    // Fetch supplier
+    enqueue({ data: supplier, error: null })
+    // RPC get_next_arrival_number
+    enqueue({ data: 5 })
+    // Insert invoice
+    enqueue({ data: createdInvoice, error: null })
+    // Insert items
+    enqueue({ data: null, error: null })
+    // Fetch company settings: accrual + deferred booking
+    enqueue({ data: { accounting_method: 'accrual', defer_invoice_booking: true }, error: null })
+
+    const request = createMockRequest('/api/supplier-invoices', {
+      method: 'POST',
+      body: {
+        supplier_id: VALID_UUID,
+        supplier_invoice_number: 'LF-002',
+        invoice_date: '2024-06-01',
+        due_date: '2024-07-01',
+        items: [
+          {
+            description: 'Material',
+            quantity: 10,
+            unit_price: 800,
+            account_number: '4010',
+            vat_rate: 0.25,
+          },
+        ],
+      },
+    })
+    const response = await POST(request)
+    const { status, body } = await parseJsonResponse<{
+      data: { registration_journal_entry_id: string | null }
+    }>(response)
+
+    expect(status).toBe(200)
+    expect(body.data).toBeTruthy()
+    // No registration verifikat: booking is a separate explicit step.
+    expect(mockCreateSupplierInvoiceRegistrationEntry).not.toHaveBeenCalled()
+    expect(body.data.registration_journal_entry_id ?? null).toBeNull()
+  })
+
+  it('stores an uploaded document and links it to the registration entry', async () => {
+    const supplier = makeSupplier({ id: VALID_UUID })
+    const createdInvoice = makeSupplierInvoice({ id: 'si-with-document', document_id: DOCUMENT_UUID })
+
+    enqueue({ data: { id: DOCUMENT_UUID, journal_entry_id: null }, error: null })
+    enqueue({ data: null, error: null })
+    enqueue({ data: supplier, error: null })
+    enqueue({ data: 6 })
+    enqueue({ data: createdInvoice, error: null })
+    enqueue({ data: null, error: null })
+    enqueue({ data: { accounting_method: 'accrual' }, error: null })
+    mockCreateSupplierInvoiceRegistrationEntry.mockResolvedValue({ id: 'je-document' })
+    enqueue({ data: null, error: null })
+    mockLinkToJournalEntry.mockResolvedValue({ id: DOCUMENT_UUID })
+
+    const request = createMockRequest('/api/supplier-invoices', {
+      method: 'POST',
+      body: {
+        supplier_id: VALID_UUID,
+        document_id: DOCUMENT_UUID,
+        supplier_invoice_number: 'LF-DOCUMENT',
+        invoice_date: '2024-06-01',
+        due_date: '2024-07-01',
+        items: [
+          { description: 'Service', quantity: 1, unit_price: 1000, account_number: '6200' },
+        ],
+      },
+    })
+
+    const response = await POST(request)
+    const { status, body } = await parseJsonResponse<{
+      data: { document_id: string; registration_journal_entry_id: string }
+    }>(response)
+
+    expect(status).toBe(200)
+    expect(body.data.document_id).toBe(DOCUMENT_UUID)
+    expect(body.data.registration_journal_entry_id).toBe('je-document')
+    expect(mockLinkToJournalEntry).toHaveBeenCalledWith(
+      mockSupabase,
+      'company-1',
+      DOCUMENT_UUID,
+      'je-document',
+    )
+  })
+
+  it('rejects a document that is missing or outside the active company', async () => {
+    enqueue({ data: null, error: null })
+
+    const request = createMockRequest('/api/supplier-invoices', {
+      method: 'POST',
+      body: {
+        supplier_id: VALID_UUID,
+        document_id: DOCUMENT_UUID,
+        supplier_invoice_number: 'LF-INVALID-DOCUMENT',
+        invoice_date: '2024-06-01',
+        due_date: '2024-07-01',
+        items: [
+          { description: 'Service', quantity: 1, unit_price: 1000, account_number: '6200' },
+        ],
+      },
+    })
+
+    const response = await POST(request)
+    const { status, body } = await parseJsonResponse<{ error: { code: string } }>(response)
+
+    expect(status).toBe(400)
+    expect(body.error.code).toBe('SI_CREATE_INVALID_INPUT')
+    expect(mockCreateSupplierInvoiceRegistrationEntry).not.toHaveBeenCalled()
+    expect(mockLinkToJournalEntry).not.toHaveBeenCalled()
   })
 
   it('emits supplier_invoice.registered event', async () => {
@@ -340,7 +503,7 @@ describe('POST /api/supplier-invoices', () => {
     expect(status).toBe(400)
     expect(body.error.code).toBe('SI_CREATE_NO_FISCAL_PERIOD')
     expect(mockCreateSupplierInvoiceRegistrationEntry).toHaveBeenCalled()
-    // The orphan must be rolled back — the delete is the 6th queued call.
+    // The orphan must be rolled back: the delete is the 6th queued call.
     expect(mockSupabase.from).toHaveBeenCalledWith('supplier_invoices')
   })
 
@@ -453,7 +616,7 @@ describe('POST /api/supplier-invoices', () => {
           'duplicate key value violates unique constraint "idx_supplier_invoices_company_supplier_number"',
       },
     })
-    // Lookup returns null — the row was deleted between the failing insert and our fetch
+    // Lookup returns null: the row was deleted between the failing insert and our fetch
     enqueue({ data: null, error: null })
 
     const request = createMockRequest('/api/supplier-invoices', {

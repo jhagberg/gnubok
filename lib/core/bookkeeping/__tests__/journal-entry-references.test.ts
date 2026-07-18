@@ -8,11 +8,11 @@ import { getJournalEntryUnderlagReferences } from '../journal-entry-references'
  * mock consumes one enqueued result per `.from()` call:
  *   1. invoices                  (direct journal_entry_id link)
  *   2. invoice_payments          (payment rows → invoice_id)
- *   3. invoices                  (by id — only when step 2 found new ids)
+ *   3. invoices                  (by id: only when step 2 found new ids)
  *   4. supplier_invoices         (registration_journal_entry_id)
  *   5. supplier_invoices         (payment_journal_entry_id)
  *   6. supplier_invoice_payments (payment rows → supplier_invoice_id)
- *   7. supplier_invoices         (by id — only when step 6 found new ids)
+ *   7. supplier_invoices         (by id: only when step 6 found new ids)
  */
 describe('getJournalEntryUnderlagReferences', () => {
   const run = (results: { data: unknown }[]) => {
@@ -29,7 +29,7 @@ describe('getJournalEntryUnderlagReferences', () => {
     // The reported gap: debit 1930 / credit 3001, invoice linked through
     // invoice_payments, no document attached and no direct invoice link.
     const refs = await run([
-      { data: [] }, // 1. invoices direct — none
+      { data: [] }, // 1. invoices direct: none
       { data: [{ invoice_id: 'inv-x' }] }, // 2. invoice_payments
       { data: [{ id: 'inv-x', invoice_number: '003' }] }, // 3. invoices by id
       { data: [] }, // 4. supplier registration
@@ -50,6 +50,23 @@ describe('getJournalEntryUnderlagReferences', () => {
     ])
 
     expect(refs).toEqual([{ type: 'supplier_invoice', id: 'si-1', number: 'LF-001' }])
+  })
+
+  it('surfaces the retained PDF through a supplier payment reference', async () => {
+    const refs = await run([
+      { data: [] }, // 1. invoices direct
+      { data: [] }, // 2. invoice_payments
+      { data: [] }, // 4. supplier registration
+      { data: [{ id: 'si-1', supplier_invoice_number: 'LF-001', document_id: 'doc-1' }] }, // 5. supplier payment
+      { data: [{ supplier_invoice_id: 'si-1' }] }, // 6. supplier_invoice_payments
+    ])
+
+    expect(refs).toEqual([{
+      type: 'supplier_invoice',
+      id: 'si-1',
+      number: 'LF-001',
+      document_id: 'doc-1',
+    }])
   })
 
   it('returns nothing when no invoice is linked (warning legitimately stays)', async () => {

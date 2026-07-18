@@ -73,9 +73,19 @@ describe('calculateAge', () => {
 })
 
 describe('calculateAgeAtYearStart', () => {
-  it('calculates age at January 1 of given year', () => {
-    expect(calculateAgeAtYearStart('199001019802', 2026)).toBe(36)
+  // Skatteverket applies "vid årets ingång fyllt X" rules as birth-year
+  // ranges, so the age is the one attained by December 31 of the prior year.
+  it('is birth-year based: same birth year means same year-start age', () => {
+    expect(calculateAgeAtYearStart('199006159802', 2026)).toBe(35)
     expect(calculateAgeAtYearStart('199012319802', 2026)).toBe(35)
+  })
+
+  it('does not count a January 1 birthday as attained at årets ingång', () => {
+    // The 2026 youth cohort is born 2003-2007: born 2003-01-01 must read
+    // as 22 (eligible) and born 2008-01-01 as 17 (not eligible).
+    expect(calculateAgeAtYearStart('199001019802', 2026)).toBe(35)
+    expect(calculateAgeAtYearStart('200301011234', 2026)).toBe(22)
+    expect(calculateAgeAtYearStart('200801011234', 2026)).toBe(17)
   })
 })
 
@@ -111,5 +121,19 @@ describe('encryption roundtrip', () => {
     const a = encryptPersonnummer(pnr)
     const b = encryptPersonnummer(pnr)
     expect(a).not.toBe(b)
+  })
+})
+
+describe('decryptPersonnummer tolerance for unencrypted rows', () => {
+  it('passes a raw 12-digit personnummer through unchanged (no crash)', () => {
+    // A row stored unencrypted (pre-fix v1 create, or a seed) would otherwise
+    // be sliced as iv/ciphertext/tag and throw ERR_CRYPTO_INVALID_AUTH_TAG
+    // ("Invalid authentication tag length: 6"), 500-ing the whole roster.
+    expect(decryptPersonnummer('190001010000')).toBe('190001010000')
+  })
+
+  it('still decrypts genuine ciphertext', () => {
+    const enc = encryptPersonnummer('199001019802')
+    expect(decryptPersonnummer(enc)).toBe('199001019802')
   })
 })

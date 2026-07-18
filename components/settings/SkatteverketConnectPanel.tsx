@@ -1,13 +1,14 @@
 'use client'
 
 import { useTranslations } from 'next-intl'
-import { useEffect, useState } from 'react'
+import { useCallback, useEffect, useRef, useState } from 'react'
 import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card'
 import { Button } from '@/components/ui/button'
 import { Badge } from '@/components/ui/badge'
 import { useToast } from '@/components/ui/use-toast'
 import { useCapability } from '@/contexts/CompanyContext'
 import { CAPABILITY } from '@/lib/entitlements/keys'
+import { UpgradeNote } from '@/components/billing/UpgradeNote'
 import { CheckCircle2, ExternalLink, ShieldOff, FlaskConical, ShieldAlert } from 'lucide-react'
 
 type Environment = 'test' | 'prod'
@@ -18,6 +19,8 @@ type Status =
       connected: true
       expired: boolean
       canRefresh: boolean
+      needsReconsent?: boolean
+      lastErrorCode?: string | null
       scope: string
       expiresAt: string
       environment?: Environment
@@ -25,12 +28,48 @@ type Status =
     }
 
 export function SkatteverketConnectPanel() {
+  return (
+    <div className="space-y-4">
+      <SkatteverketPersonalConnectionCard />
+      <SkatteverketSystemConnectionCard />
+    </div>
+  )
+}
+
+function SkatteverketPersonalConnectionCard() {
   const t = useTranslations('settings_skatteverket_connect')
+  // Toast strings shared with TaxSettingsContent's query-param fallback path.
+  const tOauth = useTranslations('settings_skatteverket')
   const { toast } = useToast()
   const hasSkatteverket = useCapability(CAPABILITY.skatteverket)
   const [status, setStatus] = useState<Status | null>(null)
   const [loading, setLoading] = useState(true)
   const [disconnecting, setDisconnecting] = useState(false)
+  // True while an OAuth tab opened from this panel is still alive. Disables
+  // the connect button so a second click cannot start a parallel flow: each
+  // /authorize call overwrites the stored oauth_state + PKCE verifier, so a
+  // parallel flow guarantees a CSRF failure for whichever tab finishes last.
+  const [connecting, setConnecting] = useState(false)
+  // Handle of the OAuth tab opened by startConnect: used to verify the
+  // sender identity of incoming postMessages and to detect abandonment.
+  const popupRef = useRef<Window | null>(null)
+  const watchTimerRef = useRef<ReturnType<typeof setInterval> | null>(null)
+  const delayedRefetchRef = useRef<ReturnType<typeof setTimeout> | null>(null)
+
+  const stopWatchingOauthTab = useCallback(() => {
+    if (watchTimerRef.current) {
+      clearInterval(watchTimerRef.current)
+      watchTimerRef.current = null
+    }
+    setConnecting(false)
+  }, [])
+
+  useEffect(() => {
+    return () => {
+      if (watchTimerRef.current) clearInterval(watchTimerRef.current)
+      if (delayedRefetchRef.current) clearTimeout(delayedRefetchRef.current)
+    }
+  }, [])
 
   // docs: https://www7.skatteverket.se/portal-wapi/open/apier-och-oppna-data/utvecklarportalen/v1/getFile/tjanstebeskrivning-skattekonto-hamta-huvudmans-saldo-och-transaktioner-v101
   const SCOPE_LABELS: Record<string, string> = {
@@ -41,8 +80,12 @@ export function SkatteverketConnectPanel() {
     agd: t('scope_agd'),
   }
 
-  async function loadStatus() {
-    setLoading(true)
+  // Only the first load blanks the card to the loading state: later refetches
+  // (postMessage, closed-tab watcher, delayed sync refetch, visibility) update
+  // in the background so the panel doesn't flash on every signal.
+  const hasLoadedRef = useRef(false)
+  const loadStatus = useCallback(async () => {
+    if (!hasLoadedRef.current) setLoading(true)
     try {
       const res = await fetch('/api/extensions/ext/skatteverket/status')
       if (res.status === 503) {
@@ -54,20 +97,118 @@ export function SkatteverketConnectPanel() {
     } catch {
       setStatus({ connected: false })
     } finally {
+      hasLoadedRef.current = true
       setLoading(false)
     }
-  }
+  }, [])
 
   useEffect(() => {
     loadStatus()
-  }, [])
+  }, [loadStatus])
+
+  // Safety net for completion signals that never reach this tab: a mobile
+  // BankID app-switch can land the OAuth return in a different browser tab,
+  // and a bfcache-restored page shows a pre-connection snapshot. Refetch
+  // status whenever the tab regains visibility, throttled so rapid tab
+  // toggling doesn't hammer the API.
+  const lastVisibilityFetchRef = useRef(0)
+  useEffect(() => {
+    function onVisible() {
+      if (document.visibilityState !== 'visible') return
+      const now = Date.now()
+      if (now - lastVisibilityFetchRef.current < 5_000) return
+      lastVisibilityFetchRef.current = now
+      loadStatus()
+    }
+    document.addEventListener('visibilitychange', onVisible)
+    return () => document.removeEventListener('visibilitychange', onVisible)
+  }, [loadStatus])
+
+  // Listen for OAuth completion from the BankID popup (same pattern as
+  // AGIPanel): the callback page posts success/error and closes itself, so
+  // the settings page never navigates and we just re-fetch the status.
+  useEffect(() => {
+    function handleMessage(event: MessageEvent) {
+      if (event.origin !== window.location.origin) return
+      // Source-identity check: only the popup this component opened can
+      // trigger the handler; a window reference cannot be forged by other
+      // same-origin scripts.
+      if (!popupRef.current || event.source !== popupRef.current) return
+      if (event.data?.type === 'skatteverket-oauth-success') {
+        stopWatchingOauthTab()
+        toast({
+          title: tOauth('connected_title'),
+          description: tOauth('connected_description'),
+        })
+        loadStatus()
+        // Verified success: rebroadcast as an internal DOM event so passive
+        // consumers (e.g. the salary page) can react without trusting raw
+        // postMessage.
+        window.dispatchEvent(new CustomEvent('skatteverket-connection-updated'))
+        // The post-connect refresh (skattekonto sync, AGI settle, token
+        // health) now runs server-side AFTER the callback responds, so the
+        // status fetched above predates it. Refetch once more when it has
+        // plausibly settled so synced data and health flags (e.g.
+        // MISSING_SCOPE) show up without a manual reload.
+        if (delayedRefetchRef.current) clearTimeout(delayedRefetchRef.current)
+        delayedRefetchRef.current = setTimeout(() => {
+          loadStatus()
+          window.dispatchEvent(new CustomEvent('skatteverket-connection-updated'))
+        }, 15_000)
+      } else if (event.data?.type === 'skatteverket-oauth-error') {
+        stopWatchingOauthTab()
+        toast({
+          title: tOauth('connect_failed_title'),
+          description:
+            typeof event.data.reason === 'string' && event.data.reason
+              ? event.data.reason
+              : undefined,
+          variant: 'destructive',
+        })
+      }
+    }
+    window.addEventListener('message', handleMessage)
+    return () => window.removeEventListener('message', handleMessage)
+  }, [loadStatus, stopWatchingOauthTab, toast, tOauth])
 
   function startConnect() {
+    // Open the BankID OAuth flow in a NEW TAB, not a popup. The old 600x750
+    // popup could not fit Skatteverket's consent page: the approve button
+    // sat below the fold and users got stranded mid-consent. A tab gets the
+    // full viewport (and behaves natively on mobile). The callback page
+    // detects `window.opener`, posts back a message and closes itself: the
+    // settings page never navigates, so browser history stays clean and
+    // closing the settings afterwards cannot walk Back into the consumed
+    // OAuth chain (the "redirected to Skatteverket again" bug).
     const returnTo = encodeURIComponent('/settings/tax')
-    window.location.href = `/api/extensions/ext/skatteverket/authorize?return_to=${returnTo}`
+    const url = `/api/extensions/ext/skatteverket/authorize?return_to=${returnTo}`
+    const tab = window.open(url, '_blank')
+    popupRef.current = tab
+    if (!tab) {
+      // Tab blocked: fall back to the full-page flow. The callback then
+      // lands on /settings/tax?skv_connected=true, handled by
+      // TaxSettingsContent's query-param effect.
+      window.location.href = url
+      return
+    }
+    setConnecting(true)
+    // Detect abandonment: if the tab goes away without posting a message
+    // (closed manually, stranded on Skatteverket's side), re-enable the
+    // button and refresh status. This also fires after a successful
+    // self-close; the extra status fetch is harmless.
+    if (watchTimerRef.current) clearInterval(watchTimerRef.current)
+    watchTimerRef.current = setInterval(() => {
+      if (popupRef.current?.closed) {
+        stopWatchingOauthTab()
+        loadStatus()
+      }
+    }, 1000)
   }
 
   async function disconnect() {
+    // No disconnect while an OAuth tab is in flight: the callback completing
+    // right after the disconnect would silently recreate the tokens.
+    if (connecting) return
     setDisconnecting(true)
     try {
       const res = await fetch('/api/extensions/ext/skatteverket/disconnect', {
@@ -76,6 +217,9 @@ export function SkatteverketConnectPanel() {
       if (!res.ok) throw new Error(t('disconnect_failed'))
       toast({ title: t('toast_disconnected') })
       await loadStatus()
+      // Connection state changed: notify passive consumers via the same
+      // internal event as a verified OAuth success.
+      window.dispatchEvent(new CustomEvent('skatteverket-connection-updated'))
     } catch (err) {
       toast({
         title: t('toast_disconnect_failed'),
@@ -102,7 +246,7 @@ export function SkatteverketConnectPanel() {
       <Card>
         <CardHeader>
           <div className="flex items-center justify-between">
-            <CardTitle>{t('title')}</CardTitle>
+            <CardTitle className="text-base">{t('title')}</CardTitle>
             <EnvironmentBadge environment={status?.environment} disabled={status?.disabled} />
           </div>
         </CardHeader>
@@ -116,26 +260,25 @@ export function SkatteverketConnectPanel() {
           <p className="text-sm text-muted-foreground">
             {t('connect_intro')}
           </p>
-          <div className="rounded-md border border-border bg-secondary/40 p-3 text-xs text-muted-foreground">
-            {t.rich('skahmst_note', {
-              code: (chunks) => <span className="font-mono">{chunks}</span>,
-            })}
-          </div>
-          {!hasSkatteverket && (
-            <div className="rounded-lg border border-border bg-secondary/40 px-3 py-2.5 text-sm text-muted-foreground">
-              Anslutning till Skatteverket kräver ett abonnemang.{' '}
-              <a href="/settings/billing" className="underline underline-offset-2">
-                Uppgradera
-              </a>
+          {/* The skahmst consent-page note only matters when the user can
+              actually reach that page: hidden while the feature is gated. */}
+          {hasSkatteverket && (
+            <div className="rounded-md border border-border bg-secondary/40 p-3 text-xs text-muted-foreground">
+              {t.rich('skahmst_note', {
+                code: (chunks) => <span className="font-mono">{chunks}</span>,
+              })}
             </div>
+          )}
+          {!hasSkatteverket && (
+            <UpgradeNote>Anslutning till Skatteverket kräver ett abonnemang.</UpgradeNote>
           )}
           <Button
             onClick={startConnect}
-            disabled={status?.disabled || !hasSkatteverket}
+            disabled={status?.disabled || !hasSkatteverket || connecting}
             title={!hasSkatteverket ? 'Anslutning till Skatteverket kräver ett abonnemang' : undefined}
           >
             <ExternalLink className="mr-2 h-4 w-4" />
-            {t('connect_with_bankid')}
+            {connecting ? t('connect_waiting') : t('connect_with_bankid')}
           </Button>
         </CardContent>
       </Card>
@@ -152,7 +295,7 @@ export function SkatteverketConnectPanel() {
     <Card>
       <CardHeader>
         <div className="flex items-center justify-between">
-          <CardTitle className="flex items-center gap-2">
+          <CardTitle className="flex items-center gap-2 text-base">
             {t('title')}
             {status.expired ? (
               <Badge variant="destructive">{t('expired')}</Badge>
@@ -167,6 +310,19 @@ export function SkatteverketConnectPanel() {
         </div>
       </CardHeader>
       <CardContent className="space-y-4">
+        {status.needsReconsent && (
+          <div className="flex gap-2 rounded-md border border-border bg-secondary/40 p-3 text-sm text-foreground">
+            <ShieldAlert className="h-4 w-4 mt-0.5 shrink-0" />
+            {/* MISSING_SCOPE right after a connect means the user skipped a
+                behörighet on SKV's consent page; tell them exactly that
+                instead of the generic "session expired" prompt. */}
+            <p>
+              {status.lastErrorCode === 'MISSING_SCOPE'
+                ? t('missing_scope_message')
+                : t('needs_reconsent_message')}
+            </p>
+          </div>
+        )}
         <dl className="grid grid-cols-1 gap-3 text-sm sm:grid-cols-2">
           <div>
             <dt className="text-muted-foreground">{t('token_expires_label')}</dt>
@@ -218,23 +374,172 @@ export function SkatteverketConnectPanel() {
         )}
 
         <div className="flex gap-2 pt-2">
-          {(status.expired || !status.canRefresh || !scopes.includes('skattekonto') || !scopes.includes('agd')) && (
+          {/* The skattekonto read scope is named `skahmst` in the live grants;
+              accept the older `skattekonto` name too (mirrors the missing-scope
+              notice above). Checking only `skattekonto` kept this button
+              permanently visible on healthy connections. */}
+          {(status.expired || status.needsReconsent || !status.canRefresh || !(scopes.includes('skahmst') || scopes.includes('skattekonto')) || !scopes.includes('agd')) && (
             <Button
               onClick={startConnect}
-              disabled={status.disabled || !hasSkatteverket}
+              disabled={status.disabled || !hasSkatteverket || connecting}
               title={!hasSkatteverket ? 'Anslutning till Skatteverket kräver ett abonnemang' : undefined}
             >
               <ExternalLink className="mr-2 h-4 w-4" />
-              {t('reconnect')}
+              {connecting ? t('connect_waiting') : t('reconnect')}
             </Button>
           )}
           <Button
             variant="outline"
             onClick={disconnect}
-            disabled={disconnecting}
+            disabled={disconnecting || connecting}
           >
             <ShieldOff className="mr-2 h-4 w-4" />
             {disconnecting ? t('disconnecting') : t('disconnect')}
+          </Button>
+        </div>
+      </CardContent>
+    </Card>
+  )
+}
+
+type GrantStatus = 'unknown' | 'granted' | 'denied' | 'error'
+
+interface SystemConnectionState {
+  available: boolean
+  mode?: string
+  environment?: string
+  ombud_org_number?: string | null
+  grant_url?: string
+  cert?: { notAfter: string; daysUntilExpiry: number; expiresSoon: boolean } | null
+  connection?: {
+    status: string
+    lasombud_status: GrantStatus
+    moms_ombud_status: GrantStatus
+    verified_at: string | null
+    last_probe_at: string | null
+  } | null
+}
+
+/**
+ * The system (ombud + organization certificate) connection: the one-time
+ * grant that lets background syncs run without a personal BankID session.
+ * Renders nothing until SKATTEVERKET_SYSTEM_AUTH_MODE is switched on
+ * server-side, so the whole section is invisible during Phase 1.
+ */
+function SkatteverketSystemConnectionCard() {
+  const t = useTranslations('settings_skatteverket_connect')
+  const { toast } = useToast()
+  const [state, setState] = useState<SystemConnectionState | null>(null)
+  const [verifying, setVerifying] = useState(false)
+
+  async function loadState() {
+    try {
+      const res = await fetch('/api/extensions/ext/skatteverket/system-connection')
+      if (!res.ok) {
+        setState({ available: false })
+        return
+      }
+      setState((await res.json()) as SystemConnectionState)
+    } catch {
+      setState({ available: false })
+    }
+  }
+
+  useEffect(() => {
+    loadState()
+  }, [])
+
+  async function verify() {
+    setVerifying(true)
+    try {
+      const res = await fetch('/api/extensions/ext/skatteverket/system-connection/verify', {
+        method: 'POST',
+      })
+      const body = await res.json().catch(() => ({}))
+      if (res.status === 429) {
+        toast({ title: t('system_verify_rate_limited') })
+        return
+      }
+      if (!res.ok) {
+        toast({
+          title: t('system_verify_failed'),
+          description: typeof body?.error === 'string' ? body.error : undefined,
+          variant: 'destructive',
+        })
+        return
+      }
+      await loadState()
+    } catch {
+      toast({ title: t('system_verify_failed'), variant: 'destructive' })
+    } finally {
+      setVerifying(false)
+    }
+  }
+
+  if (!state?.available) return null
+
+  const grantBadge = (status: GrantStatus | undefined) => {
+    switch (status) {
+      case 'granted':
+        return (
+          <Badge variant="success">
+            <CheckCircle2 className="mr-1 h-3 w-3" />
+            {t('system_status_granted')}
+          </Badge>
+        )
+      case 'denied':
+        return <Badge variant="destructive">{t('system_status_denied')}</Badge>
+      case 'error':
+        return <Badge variant="warning">{t('system_status_error')}</Badge>
+      default:
+        return <Badge variant="outline">{t('system_status_unknown')}</Badge>
+    }
+  }
+
+  return (
+    <Card>
+      <CardHeader>
+        <CardTitle className="text-base">{t('system_title')}</CardTitle>
+      </CardHeader>
+      <CardContent className="space-y-4">
+        <p className="text-sm text-muted-foreground">{t('system_intro')}</p>
+
+        {state.ombud_org_number && (
+          <div className="rounded-md border border-border bg-secondary/40 p-3 text-sm">
+            <p className="text-muted-foreground">{t('system_org_label')}</p>
+            <p className="font-mono font-medium tabular-nums">{state.ombud_org_number}</p>
+          </div>
+        )}
+
+        <div className="grid grid-cols-1 gap-3 text-sm sm:grid-cols-2">
+          <div className="flex items-center justify-between gap-2 rounded-md border border-border p-3">
+            <span>{t('system_behorighet_lasombud')}</span>
+            {grantBadge(state.connection?.lasombud_status)}
+          </div>
+          <div className="flex items-center justify-between gap-2 rounded-md border border-border p-3">
+            <span>{t('system_behorighet_moms')}</span>
+            {grantBadge(state.connection?.moms_ombud_status)}
+          </div>
+        </div>
+
+        {state.cert?.expiresSoon && (
+          <div className="flex gap-2 rounded-md border border-border bg-secondary/40 p-3 text-sm text-foreground">
+            <ShieldAlert className="h-4 w-4 mt-0.5 shrink-0" />
+            <p>{t('system_cert_expires_soon', { days: state.cert.daysUntilExpiry })}</p>
+          </div>
+        )}
+
+        <div className="flex flex-wrap gap-2 pt-1">
+          {state.grant_url && (
+            <Button variant="outline" asChild>
+              <a href={state.grant_url} target="_blank" rel="noopener noreferrer">
+                <ExternalLink className="mr-2 h-4 w-4" />
+                {t('system_open_ombud')}
+              </a>
+            </Button>
+          )}
+          <Button onClick={verify} disabled={verifying}>
+            {verifying ? t('system_verifying') : t('system_verify')}
           </Button>
         </div>
       </CardContent>

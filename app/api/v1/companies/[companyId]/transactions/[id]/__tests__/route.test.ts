@@ -7,7 +7,7 @@
  *
  * Each test stubs the bookkeeping engine (createTransactionJournalEntry,
  * createInvoicePaymentJournalEntry, reverseEntry, etc.) so the test asserts
- * the route's orchestration — wiring of params + scope + error codes —
+ * the route's orchestration (wiring of params + scope + error codes)
  * rather than reimplementing the engine.
  */
 import { beforeAll, beforeEach, describe, expect, it, vi } from 'vitest'
@@ -27,13 +27,14 @@ vi.mock('@supabase/supabase-js', async () => {
   return { ...actual, createClient: vi.fn().mockReturnValue({}) }
 })
 
-// Engine stubs — happy-path returns reusable across cases.
-const { createTxJE, reverseEntryMock, createInvPmtJE, createInvCashJE, createSupplierInvPmtJE, findMissingAccountsMock } = vi.hoisted(() => ({
+// Engine stubs: happy-path returns reusable across cases.
+const { createTxJE, reverseEntryMock, createInvPmtJE, createInvCashJE, createSupplierInvPmtJE, createSupplierInvCashJE, findMissingAccountsMock } = vi.hoisted(() => ({
   createTxJE: vi.fn().mockResolvedValue({ id: 'je-fresh' }),
   reverseEntryMock: vi.fn().mockResolvedValue(undefined),
   createInvPmtJE: vi.fn().mockResolvedValue({ id: 'je-invpmt' }),
   createInvCashJE: vi.fn().mockResolvedValue({ id: 'je-invcash' }),
   createSupplierInvPmtJE: vi.fn().mockResolvedValue({ id: 'je-sipmt' }),
+  createSupplierInvCashJE: vi.fn().mockResolvedValue({ id: 'je-sicash' }),
   // Default: no missing accounts. Per-case overrides simulate the
   // template-references-inactive-account bug or a race where deactivation
   // happened between our validation and the engine's resolveAccountIds.
@@ -52,14 +53,23 @@ vi.mock('@/lib/bookkeeping/invoice-entries', () => ({
 }))
 vi.mock('@/lib/bookkeeping/supplier-invoice-entries', () => ({
   createSupplierInvoicePaymentEntry: createSupplierInvPmtJE,
-  createSupplierInvoiceCashEntry: vi.fn().mockResolvedValue({ id: 'je-sicash' }),
+  createSupplierInvoiceCashEntry: createSupplierInvCashJE,
 }))
 vi.mock('@/lib/invoices/match-log', () => ({
   logMatchEvent: vi.fn(),
 }))
-vi.mock('@/lib/bookkeeping/mapping-engine', () => ({
-  saveUserMappingRule: vi.fn().mockResolvedValue(undefined),
-}))
+vi.mock('@/lib/bookkeeping/mapping-engine', async () => {
+  // Keep the real applySettlementAccount: it's a pure rewrite (1930 -> the
+  // resolved bank leg) and the v1 categorize route's settlement-account fix
+  // depends on it actually running, not a stub.
+  const actual = await vi.importActual<typeof import('@/lib/bookkeeping/mapping-engine')>(
+    '@/lib/bookkeeping/mapping-engine',
+  )
+  return {
+    ...actual,
+    saveUserMappingRule: vi.fn().mockResolvedValue(undefined),
+  }
+})
 vi.mock('@/lib/bookkeeping/counterparty-templates', () => ({
   upsertCounterpartyTemplate: vi.fn().mockResolvedValue(undefined),
   buildMappingResultFromCounterpartyTemplate: vi.fn(),
@@ -73,7 +83,7 @@ vi.mock('@/lib/bookkeeping/account-validation', async () => {
     findUnresolvableAccounts: findMissingAccountsMock,
   }
 })
-// category mapping is real — provides the debit/credit account guarantees.
+// category mapping is real: provides the debit/credit account guarantees.
 
 import { validateApiKey, createServiceClientNoCookies } from '@/lib/auth/api-keys'
 import { POST as categorizePOST } from '../categorize/route'
@@ -268,7 +278,7 @@ describe('POST :id/categorize', () => {
     // The v1 envelope routes typed bookkeeping errors through
     // extractBookkeepingDetails, which places account_numbers under details.
     expect(body.error.details.account_numbers).toEqual(['5410'])
-    // Engine and transaction-update must NOT run — the row stays in the
+    // Engine and transaction-update must NOT run: the row stays in the
     // categorization queue so the user can re-activate and retry.
     expect(createTxJE).not.toHaveBeenCalled()
   })
@@ -293,7 +303,7 @@ describe('POST :id/categorize', () => {
         fiscal_periods: { data: { id: 'period-1', is_closed: false, locked_at: null }, error: null },
       }),
     )
-    // Pre-validation passes — race condition where an account got
+    // Pre-validation passes: race condition where an account got
     // deactivated between our chart_of_accounts read and the engine's
     // resolveAccountIds read. The engine throws and the catch in the route
     // must short-circuit to a structured 400 rather than falling through
@@ -314,6 +324,123 @@ describe('POST :id/categorize', () => {
     const body = await res.json()
     expect(body.error.code).toBe('ACCOUNTS_NOT_IN_CHART')
     expect(body.error.details.account_numbers).toEqual(['5410'])
+  })
+
+  // Regression for the v1/MCP-facing half of the settlement-account gap
+  // fixed on the dashboard route by PR #985: this v1 route never called
+  // applySettlementAccount at all, so every category booking hardcoded the
+  // bank leg to 1930 even when the transaction was linked to a different
+  // cash account (e.g. a savings or EUR account).
+  it('books the bank leg to the transaction\'s linked cash account, not hardcoded 1930', async () => {
+    mockServiceClient.mockReturnValue(
+      makeFlexibleSupabase({
+        company_members: { data: { company_id: COMPANY_ID, role: 'owner' }, error: null },
+        transactions: [
+          {
+            data: {
+              id: TX_ID,
+              company_id: COMPANY_ID,
+              date: '2026-05-12',
+              amount: -349.5,
+              currency: 'SEK',
+              merchant_name: 'ICA',
+              journal_entry_id: null,
+              cash_account_id: 'ca-1940',
+            },
+            error: null,
+          },
+          { data: [{ id: TX_ID }], error: null }, // CAS update select
+        ],
+        company_settings: { data: { entity_type: 'enskild_firma' }, error: null },
+        cash_accounts: { data: { ledger_account: '1940' }, error: null },
+      }),
+    )
+
+    const res = await categorizePOST(
+      makeRequest(
+        `https://x.test/api/v1/companies/${COMPANY_ID}/transactions/${TX_ID}/categorize`,
+        { is_business: true, category: 'expense_office' },
+      ),
+      txParams(TX_ID),
+    )
+    expect(res.status).toBe(200)
+    expect(createTxJE).toHaveBeenCalledTimes(1)
+    const mappingResult = createTxJE.mock.calls[0][4] as {
+      debit_account: string
+      credit_account: string
+    }
+    expect(mappingResult.credit_account).toBe('1940')
+  })
+
+  it('falls back to 1930 when the transaction has no linked cash account', async () => {
+    mockServiceClient.mockReturnValue(
+      makeFlexibleSupabase({
+        company_members: { data: { company_id: COMPANY_ID, role: 'owner' }, error: null },
+        transactions: [
+          {
+            data: {
+              id: TX_ID,
+              company_id: COMPANY_ID,
+              date: '2026-05-12',
+              amount: -349.5,
+              currency: 'SEK',
+              merchant_name: 'ICA',
+              journal_entry_id: null,
+              cash_account_id: null,
+            },
+            error: null,
+          },
+          { data: [{ id: TX_ID }], error: null },
+        ],
+        company_settings: { data: { entity_type: 'enskild_firma' }, error: null },
+      }),
+    )
+
+    const res = await categorizePOST(
+      makeRequest(
+        `https://x.test/api/v1/companies/${COMPANY_ID}/transactions/${TX_ID}/categorize`,
+        { is_business: true, category: 'expense_office' },
+      ),
+      txParams(TX_ID),
+    )
+    expect(res.status).toBe(200)
+    const mappingResult = createTxJE.mock.calls[0][4] as { credit_account: string }
+    expect(mappingResult.credit_account).toBe('1930')
+  })
+
+  it('aborts with 500 BOOKKEEPING_DATABASE_ERROR when the cash_accounts lookup errors, mutating nothing', async () => {
+    mockServiceClient.mockReturnValue(
+      makeFlexibleSupabase({
+        company_members: { data: { company_id: COMPANY_ID, role: 'owner' }, error: null },
+        transactions: {
+          data: {
+            id: TX_ID,
+            company_id: COMPANY_ID,
+            date: '2026-05-12',
+            amount: -349.5,
+            currency: 'SEK',
+            merchant_name: 'ICA',
+            journal_entry_id: null,
+            cash_account_id: 'ca-broken',
+          },
+          error: null,
+        },
+        company_settings: { data: { entity_type: 'enskild_firma' }, error: null },
+        cash_accounts: { data: null, error: { message: 'connection reset' } },
+      }),
+    )
+
+    const res = await categorizePOST(
+      makeRequest(
+        `https://x.test/api/v1/companies/${COMPANY_ID}/transactions/${TX_ID}/categorize`,
+        { is_business: true, category: 'expense_office' },
+      ),
+      txParams(TX_ID),
+    )
+    expect(res.status).toBe(500)
+    const body = await res.json()
+    expect(body.error.code).toBe('BOOKKEEPING_DATABASE_ERROR')
+    expect(createTxJE).not.toHaveBeenCalled()
   })
 })
 
@@ -444,6 +571,224 @@ describe('POST :id/match-invoice', () => {
     expect(res.status).toBe(400)
     expect((await res.json()).error.code).toBe('MATCH_INVOICE_TX_ALREADY_LINKED')
   })
+
+  it('rejects a credit note before creating a payment journal entry', async () => {
+    mockServiceClient.mockReturnValue(
+      makeFlexibleSupabase({
+        company_members: { data: { company_id: COMPANY_ID, role: 'owner' }, error: null },
+        transactions: {
+          data: {
+            id: TX_ID,
+            amount: 12500,
+            date: '2026-05-12',
+            currency: 'SEK',
+            invoice_id: null,
+          },
+          error: null,
+        },
+        invoices: {
+          data: {
+            id: INV_ID,
+            status: 'sent',
+            document_type: 'invoice',
+            total: -12500,
+            credited_invoice_id: 'ffffffff-ffff-4fff-8fff-ffffffffffff',
+          },
+          error: null,
+        },
+      }),
+    )
+
+    const res = await matchInvoicePOST(
+      makeRequest(
+        `https://x.test/api/v1/companies/${COMPANY_ID}/transactions/${TX_ID}/match-invoice`,
+        { invoice_id: INV_ID },
+      ),
+      txParams(TX_ID),
+    )
+
+    expect(res.status).toBe(400)
+    expect((await res.json()).error.code).toBe('MATCH_INVOICE_CREDIT_NOTE')
+    expect(createInvPmtJE).not.toHaveBeenCalled()
+    expect(createInvCashJE).not.toHaveBeenCalled()
+  })
+
+  // The v1 route threads resolveSettlementAccount(transaction.cash_account_id)
+  // exactly like the dashboard route and the agent/MCP commit path; these
+  // regression tests were missing here (flagged in triage on #987) even
+  // though the lib-level resolveSettlementAccount tests and the dashboard
+  // route tests already cover the same behavior.
+  describe('settlement account resolution', () => {
+    it('credits the transaction\'s own linked cash account, not 1930', async () => {
+      mockServiceClient.mockReturnValue(
+        makeFlexibleSupabase({
+          company_members: { data: { company_id: COMPANY_ID, role: 'owner' }, error: null },
+          transactions: {
+            data: {
+              id: TX_ID,
+              amount: 12500,
+              date: '2026-05-12',
+              currency: 'SEK',
+              invoice_id: null,
+              journal_entry_id: null,
+              cash_account_id: 'ca-1940',
+            },
+            error: null,
+          },
+          invoices: [
+            {
+              data: {
+                id: INV_ID,
+                status: 'sent',
+                document_type: 'invoice',
+                total: 12500,
+                paid_amount: 0,
+                remaining_amount: 12500,
+                currency: 'SEK',
+                exchange_rate: null,
+                customer: { name: 'Acme' },
+                items: [],
+                journal_entry_id: null,
+              },
+              error: null,
+            },
+            { data: [{ id: INV_ID }], error: null },
+          ],
+          company_settings: { data: { accounting_method: 'accrual', entity_type: 'enskild_firma' }, error: null },
+          cash_accounts: { data: { ledger_account: '1940' }, error: null },
+          invoice_payments: { data: null, error: null },
+        }),
+      )
+      const res = await matchInvoicePOST(
+        makeRequest(
+          `https://x.test/api/v1/companies/${COMPANY_ID}/transactions/${TX_ID}/match-invoice`,
+          { invoice_id: INV_ID },
+        ),
+        txParams(TX_ID),
+      )
+      expect(res.status).toBe(200)
+      const body = await res.json()
+      expect(body.data.invoice_status).toBe('paid')
+      expect(createInvPmtJE).toHaveBeenCalledWith(
+        expect.anything(),
+        COMPANY_ID,
+        'user-1',
+        expect.objectContaining({ id: INV_ID }),
+        '2026-05-12',
+        undefined,
+        'Acme',
+        12500,
+        '1940',
+      )
+    })
+
+    it('aborts with 500 BOOKKEEPING_DATABASE_ERROR (mutates nothing) when the cash_accounts lookup errors', async () => {
+      mockServiceClient.mockReturnValue(
+        makeFlexibleSupabase({
+          company_members: { data: { company_id: COMPANY_ID, role: 'owner' }, error: null },
+          transactions: {
+            data: {
+              id: TX_ID,
+              amount: 12500,
+              date: '2026-05-12',
+              currency: 'SEK',
+              invoice_id: null,
+              journal_entry_id: null,
+              cash_account_id: 'ca-1940',
+            },
+            error: null,
+          },
+          invoices: {
+            data: {
+              id: INV_ID,
+              status: 'sent',
+              document_type: 'invoice',
+              total: 12500,
+              paid_amount: 0,
+              remaining_amount: 12500,
+              currency: 'SEK',
+              exchange_rate: null,
+              customer: { name: 'Acme' },
+              items: [],
+              journal_entry_id: null,
+            },
+            error: null,
+          },
+          company_settings: { data: { accounting_method: 'accrual', entity_type: 'enskild_firma' }, error: null },
+          cash_accounts: { data: null, error: { message: 'boom' } },
+        }),
+      )
+      const res = await matchInvoicePOST(
+        makeRequest(
+          `https://x.test/api/v1/companies/${COMPANY_ID}/transactions/${TX_ID}/match-invoice`,
+          { invoice_id: INV_ID },
+        ),
+        txParams(TX_ID),
+      )
+      expect(res.status).toBe(500)
+      const body = await res.json()
+      expect(body.error.code).toBe('BOOKKEEPING_DATABASE_ERROR')
+      expect(createInvPmtJE).not.toHaveBeenCalled()
+      expect(createInvCashJE).not.toHaveBeenCalled()
+    })
+
+    it('returns 400 ACCOUNTS_NOT_IN_CHART when the linked cash account is deactivated in the kontoplan', async () => {
+      mockServiceClient.mockReturnValue(
+        makeFlexibleSupabase({
+          company_members: { data: { company_id: COMPANY_ID, role: 'owner' }, error: null },
+          transactions: {
+            data: {
+              id: TX_ID,
+              amount: 12500,
+              date: '2026-05-12',
+              currency: 'SEK',
+              invoice_id: null,
+              journal_entry_id: null,
+              cash_account_id: 'ca-1940',
+            },
+            error: null,
+          },
+          invoices: {
+            data: {
+              id: INV_ID,
+              status: 'sent',
+              document_type: 'invoice',
+              total: 12500,
+              paid_amount: 0,
+              remaining_amount: 12500,
+              currency: 'SEK',
+              exchange_rate: null,
+              customer: { name: 'Acme' },
+              items: [],
+              journal_entry_id: null,
+            },
+            error: null,
+          },
+          company_settings: { data: { accounting_method: 'accrual', entity_type: 'enskild_firma' }, error: null },
+          cash_accounts: { data: { ledger_account: '1940' }, error: null },
+        }),
+      )
+      // Simulate the 1940 account existing in cash_accounts but having been
+      // deactivated in chart_of_accounts since.
+      findMissingAccountsMock.mockResolvedValueOnce(['1940'])
+
+      const res = await matchInvoicePOST(
+        makeRequest(
+          `https://x.test/api/v1/companies/${COMPANY_ID}/transactions/${TX_ID}/match-invoice`,
+          { invoice_id: INV_ID },
+        ),
+        txParams(TX_ID),
+      )
+      expect(res.status).toBe(400)
+      const body = await res.json()
+      expect(body.error.code).toBe('ACCOUNTS_NOT_IN_CHART')
+      expect(body.error.details.account_numbers).toEqual(['1940'])
+      // Engine and invoice/transaction updates must NOT run: the match stays
+      // retryable rather than posting a payment against a dead account.
+      expect(createInvPmtJE).not.toHaveBeenCalled()
+      expect(createInvCashJE).not.toHaveBeenCalled()
+    })
+  })
 })
 
 describe('POST :id/match-supplier-invoice', () => {
@@ -511,5 +856,457 @@ describe('POST :id/match-supplier-invoice', () => {
     )
     expect(res.status).toBe(400)
     expect((await res.json()).error.code).toBe('MATCH_SI_NOT_EXPENSE')
+  })
+
+  // Regression for the v1/MCP-facing half of the settlement-account gap
+  // fixed on the dashboard route by PR #985: this route always called
+  // createSupplierInvoicePaymentEntry with no paymentAccount argument at all
+  // (hardcoded internal default 1930) for every pure-SEK accrual match,
+  // regardless of which cash account the transaction was actually linked to.
+  describe('settlement account resolution (pure-SEK accrual path)', () => {
+    it('credits the transaction\'s own linked cash account when it is not the primary 1930', async () => {
+      mockServiceClient.mockReturnValue(
+        makeFlexibleSupabase({
+          company_members: { data: { company_id: COMPANY_ID, role: 'owner' }, error: null },
+          transactions: {
+            data: {
+              id: TX_ID,
+              amount: -5000,
+              date: '2026-05-12',
+              currency: 'SEK',
+              supplier_invoice_id: null,
+              journal_entry_id: null,
+              cash_account_id: 'ca-1940',
+            },
+            error: null,
+          },
+          supplier_invoices: [
+            {
+              data: {
+                id: SI_ID,
+                status: 'approved',
+                total: 5000,
+                paid_amount: 0,
+                remaining_amount: 5000,
+                currency: 'SEK',
+                exchange_rate: null,
+                supplier: { name: 'Acme', supplier_type: 'swedish_business' },
+                items: [],
+              },
+              error: null,
+            },
+            { data: [{ id: SI_ID }], error: null },
+          ],
+          company_settings: { data: { accounting_method: 'accrual' }, error: null },
+          cash_accounts: { data: { ledger_account: '1940' }, error: null },
+          supplier_invoice_payments: { data: null, error: null },
+        }),
+      )
+      const res = await matchSIPOST(
+        makeRequest(
+          `https://x.test/api/v1/companies/${COMPANY_ID}/transactions/${TX_ID}/match-supplier-invoice`,
+          { supplier_invoice_id: SI_ID },
+        ),
+        txParams(TX_ID),
+      )
+      expect(res.status).toBe(200)
+      expect(createSupplierInvPmtJE).toHaveBeenCalledTimes(1)
+      const paymentAccountArg = createSupplierInvPmtJE.mock.calls[0][8]
+      expect(paymentAccountArg).toBe('1940')
+    })
+
+    it('ignores a stale last_supplier_payment_account setting and uses the linked cash account', async () => {
+      mockServiceClient.mockReturnValue(
+        makeFlexibleSupabase({
+          company_members: { data: { company_id: COMPANY_ID, role: 'owner' }, error: null },
+          transactions: {
+            data: {
+              id: TX_ID,
+              amount: -1001,
+              date: '2026-02-01',
+              currency: 'SEK',
+              supplier_invoice_id: null,
+              journal_entry_id: null,
+              cash_account_id: 'ca-1930',
+            },
+            error: null,
+          },
+          supplier_invoices: [
+            {
+              data: {
+                id: SI_ID,
+                status: 'registered',
+                total: 1001,
+                paid_amount: 0,
+                remaining_amount: 1001,
+                currency: 'SEK',
+                exchange_rate: null,
+                supplier: { name: 'Acme', supplier_type: 'swedish_business' },
+                items: [],
+              },
+              error: null,
+            },
+            { data: [{ id: SI_ID }], error: null },
+          ],
+          // Stale sticky setting from an earlier private-funds mark-paid
+          // payment: must be ignored, this route never reads it.
+          company_settings: {
+            data: { accounting_method: 'accrual', last_supplier_payment_account: '2893' },
+            error: null,
+          },
+          cash_accounts: { data: { ledger_account: '1930' }, error: null },
+          supplier_invoice_payments: { data: null, error: null },
+        }),
+      )
+      const res = await matchSIPOST(
+        makeRequest(
+          `https://x.test/api/v1/companies/${COMPANY_ID}/transactions/${TX_ID}/match-supplier-invoice`,
+          { supplier_invoice_id: SI_ID },
+        ),
+        txParams(TX_ID),
+      )
+      expect(res.status).toBe(200)
+      const paymentAccountArg = createSupplierInvPmtJE.mock.calls[0][8]
+      expect(paymentAccountArg).toBe('1930')
+      expect(paymentAccountArg).not.toBe('2893')
+    })
+
+    it('defaults to 1930 when the transaction has no linked cash account', async () => {
+      mockServiceClient.mockReturnValue(
+        makeFlexibleSupabase({
+          company_members: { data: { company_id: COMPANY_ID, role: 'owner' }, error: null },
+          transactions: {
+            data: {
+              id: TX_ID,
+              amount: -750,
+              date: '2026-02-01',
+              currency: 'SEK',
+              supplier_invoice_id: null,
+              journal_entry_id: null,
+              cash_account_id: null,
+            },
+            error: null,
+          },
+          supplier_invoices: [
+            {
+              data: {
+                id: SI_ID,
+                status: 'registered',
+                total: 750,
+                paid_amount: 0,
+                remaining_amount: 750,
+                currency: 'SEK',
+                exchange_rate: null,
+                supplier: { name: 'Acme', supplier_type: 'swedish_business' },
+                items: [],
+              },
+              error: null,
+            },
+            { data: [{ id: SI_ID }], error: null },
+          ],
+          company_settings: { data: { accounting_method: 'accrual' }, error: null },
+          supplier_invoice_payments: { data: null, error: null },
+        }),
+      )
+      const res = await matchSIPOST(
+        makeRequest(
+          `https://x.test/api/v1/companies/${COMPANY_ID}/transactions/${TX_ID}/match-supplier-invoice`,
+          { supplier_invoice_id: SI_ID },
+        ),
+        txParams(TX_ID),
+      )
+      expect(res.status).toBe(200)
+      const paymentAccountArg = createSupplierInvPmtJE.mock.calls[0][8]
+      expect(paymentAccountArg).toBe('1930')
+    })
+
+    it('aborts with 500 BOOKKEEPING_DATABASE_ERROR when the cash_accounts lookup errors, mutating nothing', async () => {
+      mockServiceClient.mockReturnValue(
+        makeFlexibleSupabase({
+          company_members: { data: { company_id: COMPANY_ID, role: 'owner' }, error: null },
+          transactions: {
+            data: {
+              id: TX_ID,
+              amount: -600,
+              date: '2026-02-01',
+              currency: 'SEK',
+              supplier_invoice_id: null,
+              journal_entry_id: null,
+              cash_account_id: 'ca-broken',
+            },
+            error: null,
+          },
+          supplier_invoices: {
+            data: {
+              id: SI_ID,
+              status: 'registered',
+              total: 600,
+              paid_amount: 0,
+              remaining_amount: 600,
+              currency: 'SEK',
+              exchange_rate: null,
+              supplier: { name: 'Acme', supplier_type: 'swedish_business' },
+              items: [],
+            },
+            error: null,
+          },
+          company_settings: { data: { accounting_method: 'accrual' }, error: null },
+          cash_accounts: { data: null, error: { message: 'connection reset' } },
+        }),
+      )
+      const res = await matchSIPOST(
+        makeRequest(
+          `https://x.test/api/v1/companies/${COMPANY_ID}/transactions/${TX_ID}/match-supplier-invoice`,
+          { supplier_invoice_id: SI_ID },
+        ),
+        txParams(TX_ID),
+      )
+      expect(res.status).toBe(500)
+      const body = await res.json()
+      expect(body.error.code).toBe('BOOKKEEPING_DATABASE_ERROR')
+      expect(createSupplierInvPmtJE).not.toHaveBeenCalled()
+    })
+
+    it('returns 400 ACCOUNTS_NOT_IN_CHART when the linked cash account is deactivated in the kontoplan', async () => {
+      mockServiceClient.mockReturnValue(
+        makeFlexibleSupabase({
+          company_members: { data: { company_id: COMPANY_ID, role: 'owner' }, error: null },
+          transactions: {
+            data: {
+              id: TX_ID,
+              amount: -5000,
+              date: '2026-05-12',
+              currency: 'SEK',
+              supplier_invoice_id: null,
+              journal_entry_id: null,
+              cash_account_id: 'ca-1940',
+            },
+            error: null,
+          },
+          supplier_invoices: {
+            data: {
+              id: SI_ID,
+              status: 'approved',
+              total: 5000,
+              paid_amount: 0,
+              remaining_amount: 5000,
+              currency: 'SEK',
+              exchange_rate: null,
+              supplier: { name: 'Acme', supplier_type: 'swedish_business' },
+              items: [],
+            },
+            error: null,
+          },
+          company_settings: { data: { accounting_method: 'accrual' }, error: null },
+          cash_accounts: { data: { ledger_account: '1940' }, error: null },
+        }),
+      )
+      // Simulate the 1940 account existing in cash_accounts but having been
+      // deactivated in chart_of_accounts since.
+      findMissingAccountsMock.mockResolvedValueOnce(['1940'])
+
+      const res = await matchSIPOST(
+        makeRequest(
+          `https://x.test/api/v1/companies/${COMPANY_ID}/transactions/${TX_ID}/match-supplier-invoice`,
+          { supplier_invoice_id: SI_ID },
+        ),
+        txParams(TX_ID),
+      )
+      expect(res.status).toBe(400)
+      const body = await res.json()
+      expect(body.error.code).toBe('ACCOUNTS_NOT_IN_CHART')
+      expect(body.error.details.account_numbers).toEqual(['1940'])
+      // Engine and invoice/transaction updates must NOT run: the match stays
+      // retryable rather than posting a payment against a dead account.
+      expect(createSupplierInvPmtJE).not.toHaveBeenCalled()
+    })
+  })
+
+  // Regression for #1000: the FX and cash-method branches were left on the
+  // entry generators' internal 1930 default when the pure-SEK path was fixed
+  // (#986). A foreign-currency match, or a kontantmetoden match, settling
+  // from a non-primary account (e.g. a EUR account on 1940) was still
+  // misbooked to 1930.
+  describe('settlement account resolution (FX and cash-method branches)', () => {
+    function fxTables(cashAccountId: string | null) {
+      return {
+        company_members: { data: { company_id: COMPANY_ID, role: 'owner' }, error: null },
+        transactions: {
+          data: {
+            id: TX_ID,
+            amount: -2400,
+            date: '2026-05-12',
+            currency: 'SEK',
+            amount_sek: null,
+            supplier_invoice_id: null,
+            journal_entry_id: null,
+            cash_account_id: cashAccountId,
+          },
+          error: null,
+        },
+        supplier_invoices: [
+          {
+            data: {
+              id: SI_ID,
+              status: 'approved',
+              total: 225,
+              paid_amount: 0,
+              remaining_amount: 225,
+              currency: 'EUR',
+              exchange_rate: 10.6254,
+              supplier: { name: 'Acme GmbH', supplier_type: 'eu_business' },
+              items: [],
+            },
+            error: null,
+          },
+          { data: [{ id: SI_ID }], error: null },
+        ],
+        company_settings: { data: { accounting_method: 'accrual' }, error: null },
+        cash_accounts: { data: { ledger_account: '1940' }, error: null },
+        supplier_invoice_payments: { data: null, error: null },
+      }
+    }
+
+    function cashMethodTables(cashAccountId: string | null) {
+      return {
+        company_members: { data: { company_id: COMPANY_ID, role: 'owner' }, error: null },
+        transactions: {
+          data: {
+            id: TX_ID,
+            amount: -5000,
+            date: '2026-05-12',
+            currency: 'SEK',
+            amount_sek: null,
+            supplier_invoice_id: null,
+            journal_entry_id: null,
+            cash_account_id: cashAccountId,
+          },
+          error: null,
+        },
+        supplier_invoices: [
+          {
+            data: {
+              id: SI_ID,
+              status: 'approved',
+              total: 5000,
+              paid_amount: 0,
+              remaining_amount: 5000,
+              currency: 'SEK',
+              exchange_rate: null,
+              supplier: { name: 'Acme', supplier_type: 'swedish_business' },
+              items: [],
+            },
+            error: null,
+          },
+          { data: [{ id: SI_ID }], error: null },
+        ],
+        company_settings: { data: { accounting_method: 'cash' }, error: null },
+        cash_accounts: { data: { ledger_account: '1940' }, error: null },
+        supplier_invoice_payments: { data: null, error: null },
+      }
+    }
+
+    it('FX branch: credits the transaction\'s own linked non-1930 account', async () => {
+      mockServiceClient.mockReturnValue(makeFlexibleSupabase(fxTables('ca-1940')))
+      const res = await matchSIPOST(
+        makeRequest(
+          `https://x.test/api/v1/companies/${COMPANY_ID}/transactions/${TX_ID}/match-supplier-invoice`,
+          { supplier_invoice_id: SI_ID },
+        ),
+        txParams(TX_ID),
+      )
+      expect(res.status).toBe(200)
+      expect(createSupplierInvPmtJE).toHaveBeenCalledTimes(1)
+      const args = createSupplierInvPmtJE.mock.calls[0]
+      // Confirm we exercised the FX branch: 225 EUR @ 10.6254 booked as
+      // 2390.72 SEK, bank paid 2400 SEK -> loss of 9.28.
+      expect(args[4]).toBeCloseTo(2390.72, 2)
+      expect(args[6]).toBeCloseTo(-9.28, 2)
+      expect(args[8]).toBe('1940')
+    })
+
+    it('FX branch: falls back to 1930 when the transaction has no linked cash account', async () => {
+      mockServiceClient.mockReturnValue(makeFlexibleSupabase(fxTables(null)))
+      const res = await matchSIPOST(
+        makeRequest(
+          `https://x.test/api/v1/companies/${COMPANY_ID}/transactions/${TX_ID}/match-supplier-invoice`,
+          { supplier_invoice_id: SI_ID },
+        ),
+        txParams(TX_ID),
+      )
+      expect(res.status).toBe(200)
+      expect(createSupplierInvPmtJE.mock.calls[0][8]).toBe('1930')
+    })
+
+    it('cash-method branch: credits the transaction\'s own linked non-1930 account', async () => {
+      mockServiceClient.mockReturnValue(makeFlexibleSupabase(cashMethodTables('ca-1940')))
+      const res = await matchSIPOST(
+        makeRequest(
+          `https://x.test/api/v1/companies/${COMPANY_ID}/transactions/${TX_ID}/match-supplier-invoice`,
+          { supplier_invoice_id: SI_ID },
+        ),
+        txParams(TX_ID),
+      )
+      expect(res.status).toBe(200)
+      expect(createSupplierInvCashJE).toHaveBeenCalledTimes(1)
+      expect(createSupplierInvPmtJE).not.toHaveBeenCalled()
+      const args = createSupplierInvCashJE.mock.calls[0]
+      expect(args[8]).toBe('1940')
+      // Pure SEK settlement: no settledBankSek override.
+      expect(args[9]).toBeUndefined()
+    })
+
+    it('cash-method branch: falls back to 1930 when the transaction has no linked cash account', async () => {
+      mockServiceClient.mockReturnValue(makeFlexibleSupabase(cashMethodTables(null)))
+      const res = await matchSIPOST(
+        makeRequest(
+          `https://x.test/api/v1/companies/${COMPANY_ID}/transactions/${TX_ID}/match-supplier-invoice`,
+          { supplier_invoice_id: SI_ID },
+        ),
+        txParams(TX_ID),
+      )
+      expect(res.status).toBe(200)
+      expect(createSupplierInvCashJE.mock.calls[0][8]).toBe('1930')
+    })
+
+    it('cash-method branch: rejects with ACCOUNTS_NOT_IN_CHART when the resolved account is deactivated', async () => {
+      // The chart pre-validation guard must cover the branches that now
+      // consume paymentAccount, not only the pure-SEK accrual path.
+      mockServiceClient.mockReturnValue(makeFlexibleSupabase(cashMethodTables('ca-1940')))
+      findMissingAccountsMock.mockResolvedValueOnce(['1940'])
+      const res = await matchSIPOST(
+        makeRequest(
+          `https://x.test/api/v1/companies/${COMPANY_ID}/transactions/${TX_ID}/match-supplier-invoice`,
+          { supplier_invoice_id: SI_ID },
+        ),
+        txParams(TX_ID),
+      )
+      expect(res.status).toBe(400)
+      expect((await res.json()).error.code).toBe('ACCOUNTS_NOT_IN_CHART')
+      expect(createSupplierInvCashJE).not.toHaveBeenCalled()
+    })
+
+    it('does NOT storno an existing conflicting JE when chart validation rejects the request', async () => {
+      // Regression: the chart pre-validation must run BEFORE the
+      // conflicting-categorization storno. Otherwise a request that is
+      // ultimately rejected with ACCOUNTS_NOT_IN_CHART would first reverse
+      // the transaction's posted categorization entry: an irreversible side
+      // effect on a failed request.
+      const tables = cashMethodTables('ca-1940')
+      ;(tables.transactions.data as { journal_entry_id: string | null }).journal_entry_id = JE_ID
+      mockServiceClient.mockReturnValue(makeFlexibleSupabase(tables))
+      findMissingAccountsMock.mockResolvedValueOnce(['1940'])
+      const res = await matchSIPOST(
+        makeRequest(
+          `https://x.test/api/v1/companies/${COMPANY_ID}/transactions/${TX_ID}/match-supplier-invoice`,
+          { supplier_invoice_id: SI_ID },
+        ),
+        txParams(TX_ID),
+      )
+      expect(res.status).toBe(400)
+      expect((await res.json()).error.code).toBe('ACCOUNTS_NOT_IN_CHART')
+      expect(reverseEntryMock).not.toHaveBeenCalled()
+      expect(createSupplierInvCashJE).not.toHaveBeenCalled()
+    })
   })
 })

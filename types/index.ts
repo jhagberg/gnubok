@@ -121,11 +121,12 @@ export type AccountingMethod = 'accrual' | 'cash'
 
 // Moms reporting period
 export type MomsPeriod = 'monthly' | 'quarterly' | 'yearly'
+export type TaxFilingMethod = 'electronic' | 'paper'
 
 // Reconciliation method
 export type ReconciliationMethod = 'auto_exact' | 'auto_date_range' | 'auto_reference' | 'auto_fuzzy' | 'manual'
 
-// Processing history (behandlingshistorik) — event-driven audit trail per BFNAR 2013:2 kap 8
+// Processing history (behandlingshistorik): event-driven audit trail per BFNAR 2013:2 kap 8
 
 export type ProcessingHistoryActorType = 'user' | 'system' | 'llm' | 'cron' | 'api_key'
 
@@ -153,7 +154,7 @@ export interface ProcessingHistoryEvent {
   causation_id: string | null
   aggregate_type: ProcessingHistoryAggregateType
   aggregate_id: string
-  event_type: string // open type — validated at runtime against processing_event_types registry
+  event_type: string // open type: validated at runtime against processing_event_types registry
   payload: Record<string, unknown>
   payload_schema_version: number
   actor: ProcessingHistoryActor
@@ -178,6 +179,22 @@ export interface Profile {
   avatar_url: string | null
   created_at: string
   updated_at: string
+}
+
+// Editable invoice email texts (standard invoices only; sv + en).
+// Missing / whitespace-only fields fall back to the hardcoded defaults in
+// lib/email/invoice-templates.ts. Supports the fixed placeholder set
+// {fakturanummer} {kundnamn} {förnamn} {företag} {förfallodatum} {belopp}.
+export interface InvoiceEmailTextOverrides {
+  subject?: string
+  greeting?: string
+  body?: string
+  signoff?: string
+}
+
+export interface InvoiceEmailTexts {
+  sv?: InvoiceEmailTextOverrides
+  en?: InvoiceEmailTextOverrides
 }
 
 // Company Settings
@@ -205,11 +222,19 @@ export interface CompanySettings {
 
   // Tax registration
   pays_salaries: boolean
+  // null = never attested; deadline generation falls back to pays_salaries.
+  employer_registered?: boolean | null
+  employer_seasonal?: boolean
   f_skatt: boolean
   vat_registered: boolean
   vat_number: string | null
   moms_period: MomsPeriod | null
   periodisk_sammanstallning_period: 'monthly' | 'quarterly'
+  vat_taxable_base_over_40m: boolean
+  vat_has_eu_trade: boolean
+  vat_filing_method: TaxFilingMethod
+  periodisk_sammanstallning_enabled: boolean
+  periodisk_sammanstallning_filing_method: TaxFilingMethod
 
   // Tax contact (SKV-filings, periodisk sammanställning, AGI, etc.)
   tax_contact_name: string | null
@@ -238,14 +263,21 @@ export interface CompanySettings {
 
   // Accounting method
   accounting_method: AccountingMethod
+  // #967: when true (accrual only), registering supplier invoices / sending
+  // customer invoices does NOT book them; booking is a separate explicit step.
+  defer_invoice_booking?: boolean
 
   // Invoice settings
   invoice_prefix: string | null
   next_invoice_number: number
+  // Starting ankomstnummer for the supplier-invoice (leverantorsfaktura)
+  // series. Acts as a floor: get_next_arrival_number returns
+  // GREATEST(MAX(arrival_number)+1, next_arrival_number). Defaults to 1.
+  next_arrival_number: number
   next_delivery_note_number: number
   invoice_default_days: number
   invoice_default_notes: string | null
-  // Default "Vår referens" — pre-fills the per-invoice our_reference field.
+  // Default "Vår referens": pre-fills the per-invoice our_reference field.
   default_our_reference: string | null
 
   // Bookkeeping lock
@@ -256,14 +288,14 @@ export interface CompanySettings {
   default_voucher_series: string
   /**
    * Per-source-type default voucher series map. Keys are
-   * JournalEntrySourceType values; values are single uppercase letters A–Z.
+   * JournalEntrySourceType values; values are single uppercase letters A-Z.
    * Resolved by `lib/bookkeeping/voucher-series-resolver.ts`. Defaults to
    * all "A" entries; users can override per source via the bookkeeping
    * settings UI.
    */
   default_voucher_series_per_source_type: Partial<Record<JournalEntrySourceType, string>>
 
-  // Most recently picked BAS account for supplier invoice payments — used to
+  // Most recently picked BAS account for supplier invoice payments: used to
   // default the mark-paid dialog so repeat payments don't force re-picking.
   last_supplier_payment_account: string | null
 
@@ -288,8 +320,14 @@ export interface CompanySettings {
   invoice_header_text: string | null
   invoice_footer_text: string | null
 
+  // Editable invoice email texts. null = all defaults.
+  invoice_email_texts: InvoiceEmailTexts | null
+
   // Automation
   send_invoice_reminders: boolean
+  reminder_days_level_1: number
+  reminder_days_level_2: number
+  reminder_days_level_3: number
 
   // Reminder surcharges (dröjsmålsränta + lagstadgad påminnelseavgift)
   reminder_fee_enabled: boolean
@@ -305,6 +343,17 @@ export interface CompanySettings {
 
   // Sector
   sector_slug: string | null
+
+  // Dimensions (kostnadsställe/projekt): UI-visibility toggle only, never
+  // load-bearing for correctness. Free tier (founder decision 2026-07-02).
+  dimensions_enabled: boolean
+
+  // Salary payments (migration 20260508120000 + 20260703190000).
+  // preferred_payment_format defaults to 'pain001' — Bankgirot Lön is
+  // retired by the banks during 2026.
+  preferred_payment_format: 'bg_lb' | 'pain001'
+  salary_pay_day: number
+  salary_default_bank: 'swedbank' | 'seb' | 'handelsbanken' | 'nordea' | 'other' | null
 
   // Sandbox
   is_sandbox: boolean
@@ -366,7 +415,7 @@ export interface BankAccount {
   balance_updated_at?: string | null
 }
 
-// Cash account — first-class entity for ledger-account routing decisions.
+// Cash account: first-class entity for ledger-account routing decisions.
 // Backed by the cash_accounts table; bank_connections.accounts_data remains
 // the source for PSD2 sync metadata + UI display until a follow-up migration
 // drops it 30 days after this PR.
@@ -415,13 +464,13 @@ export interface Transaction {
 
   // The cash account (cash_accounts row) this transaction settled on. Drives
   // per-account bank reconciliation isolation and the correct bank leg when
-  // booking. Null on legacy/unresolved rows — callers fall back to currency.
+  // booking. Null on legacy/unresolved rows: callers fall back to currency.
   // See 20260606120000_transactions_cash_account_id.sql.
   cash_account_id: string | null
 
   // Details
   date: string
-  description: string  // Mutable working title — user-editable while unbooked (see PATCH /api/transactions/[id])
+  description: string  // Mutable working title: user-editable while unbooked (see PATCH /api/transactions/[id])
   // Bank/PSD2 description captured at ingest, normalized (empty/whitespace and
   // the legacy "Unknown" sentinel map to the Swedish neutral). Never overwritten
   // by user title edits; source for the dedup bridge and the "restore original"
@@ -523,6 +572,10 @@ export interface Customer {
   name: string
   customer_type: CustomerType
 
+  // User-assigned customer number (kundnummer) shown on invoices.
+  // Free text, no uniqueness enforced in v1.
+  customer_number: string | null
+
   // Contact
   email: string | null
   phone: string | null
@@ -591,7 +644,7 @@ export interface Supplier {
   updated_at: string
 }
 
-// Article (artikelregister) — reusable invoice-line preset. NON-INVENTORY:
+// Article (artikelregister): reusable invoice-line preset. NON-INVENTORY:
 // no stock fields and no inventory postings, by deliberate design.
 export type ArticleType = 'vara' | 'tjanst'
 
@@ -611,9 +664,12 @@ export interface Article {
   price_excl_vat: number
   /** Default line VAT rate as an integer percent: 25 | 12 | 6 | 0. */
   vat_rate: number
+  /** Default price currency (ISO 4217 code from the currencies table);
+   *  pre-fills the invoice currency when added. */
+  currency: string
   /** Optional BAS class-3 revenue account override. null = derive from VAT treatment. */
   revenue_account: string | null
-  /** Margin/display only — never posted to the ledger. */
+  /** Margin/display only: never posted to the ledger. */
   cost_price: number | null
   ean: string | null
   /** ROT/RUT arbetstypskod (tjänst only); pre-fills the invoice line. */
@@ -632,6 +688,7 @@ export interface CreateArticleInput {
   unit?: string
   price_excl_vat: number
   vat_rate?: number
+  currency?: string
   revenue_account?: string | null
   cost_price?: number | null
   ean?: string | null
@@ -697,6 +754,12 @@ export interface SupplierInvoice {
 
   notes: string | null
 
+  // Default dimensions bag ({sie_dim_no: code}, e.g. {"1":"KS01","6":"P001"})
+  // applied to every generated journal line; item-level `dimensions` merge on
+  // top of it for the expense lines (dimensions PR7). Stored as jsonb
+  // DEFAULT '{}'. Optional in TS for pre-migration fixtures.
+  default_dimensions?: Record<string, string>
+
   created_at: string
   updated_at: string
 
@@ -734,6 +797,10 @@ export interface SupplierInvoiceItem {
   accrual_period_start?: string | null
   accrual_period_end?: string | null
   accrual_balance_account?: string | null
+
+  // Per-item dimensions bag, merged over the invoice's default_dimensions on
+  // the expense line this item books to (dimensions PR7). jsonb DEFAULT '{}'.
+  dimensions?: Record<string, string>
 
   created_at: string
 }
@@ -823,6 +890,20 @@ export interface Invoice {
   your_reference: string | null
   our_reference: string | null
 
+  // Optional online payment link (pasted by the user, e.g. a Stripe Payment
+  // Link). Rendered as a "Betala online" button in the invoice email and as a
+  // QR code + link on the PDF. Never copied to derived documents (credit
+  // notes, conversions, recurring invoices). Optional in TS for pre-migration
+  // fixtures.
+  payment_link_url?: string | null
+  // Stripe Payment Link id (plink_...) when the link above was auto-created by
+  // the Stripe extension; NULL for manually pasted links. Deterministic
+  // matching key for checkout.session.completed events and the handle used to
+  // deactivate the link on credit/paid.
+  stripe_payment_link_id?: string | null
+  // Per-invoice opt-out for automatic payment link creation on send.
+  payment_link_auto?: boolean
+
   // Notes
   notes: string | null
 
@@ -863,10 +944,16 @@ export interface Invoice {
   // personnummer is stored only as AES-256-GCM ciphertext + the last four
   // digits (PII isolation). All three fields are null/0 on invoices with
   // no ROT/RUT lines. Optional in TypeScript to keep legacy fixtures
-  // (pre-migration) valid — treat undefined the same as 0/null.
+  // (pre-migration) valid: treat undefined the same as 0/null.
   deduction_total?: number
   deduction_personnummer_encrypted?: string | null
   deduction_personnummer_last4?: string | null
+
+  // Default dimensions bag ({sie_dim_no: code}) applied to every journal line
+  // generated from this invoice (issuance, payment, credit); item-level
+  // `dimensions` merge on top for the revenue lines (dimensions PR7).
+  // jsonb DEFAULT '{}'. Optional in TS for pre-migration fixtures.
+  default_dimensions?: Record<string, string>
 
   created_at: string
   updated_at: string
@@ -886,7 +973,7 @@ export interface InvoiceItem {
   sort_order: number
 
   // Line kind. 'product' is a normal billable line; 'text' is a free-text or
-  // blank spacer row that carries only a description — no amounts, excluded from
+  // blank spacer row that carries only a description: no amounts, excluded from
   // totals and bookkeeping. Optional in TS for legacy rows (defaults to
   // 'product' in Postgres).
   line_type?: 'product' | 'text'
@@ -933,7 +1020,7 @@ export interface InvoiceItem {
   // labor-only restriction.
   //
   // All fields are optional in TypeScript even though Postgres has
-  // defaults — legacy rows pulled before the schema change carry
+  // defaults: legacy rows pulled before the schema change carry
   // `undefined` in JS land, and many existing test fixtures predate the
   // ROT/RUT migration. Treat undefined the same as null/0 throughout.
   deduction_type?: 'rot' | 'rut' | null
@@ -945,8 +1032,61 @@ export interface InvoiceItem {
   housing_designation?: string | null
   /** Lägenhetsnummer. Optional, used for ROT in flerbostadshus. */
   apartment_number?: string | null
+  /** Bostadsrättsföreningens orgnr. ROT i bostadsrätt reports lägenhetsnummer
+   *  + BRF orgnr instead of fastighetsbeteckning (Begaran.xsd: BrfOrgNr). */
+  brf_org_number?: string | null
+
+  // Per-item dimensions bag, merged over the invoice's default_dimensions on
+  // the revenue line this item books to (dimensions PR7). jsonb DEFAULT '{}'.
+  dimensions?: Record<string, string>
 
   created_at: string
+}
+
+// Rot/rut payout request (begäran om utbetalning, Skatteverkets husavdragstjänst).
+// One row per generated HUS XML file; items link the invoices whose 1513
+// receivable the file requests. See lib/invoices/rot-rut-file.ts.
+export type RotRutPayoutRequestStatus =
+  | 'generated'
+  | 'submitted'
+  | 'paid'
+  | 'partially_paid'
+  | 'rejected'
+  | 'cancelled'
+
+export interface RotRutPayoutRequest {
+  id: string
+  company_id: string
+  user_id: string
+  deduction_type: 'rot' | 'rut'
+  /** NamnPaBegaran in the file: 1-16 chars, shown in Skatteverkets e-tjänst. */
+  name: string
+  status: RotRutPayoutRequestStatus
+  requested_total: number
+  decided_total: number | null
+  file_name: string
+  file_document_id: string | null
+  settlement_journal_entry_id: string | null
+  submitted_at: string | null
+  decided_at: string | null
+  created_at: string
+  updated_at: string
+
+  // Relations (populated when fetched)
+  items?: RotRutPayoutRequestItem[]
+}
+
+export interface RotRutPayoutRequestItem {
+  id: string
+  request_id: string
+  invoice_id: string
+  requested_amount: number
+  decided_amount: number | null
+  created_at: string
+  updated_at: string
+
+  // Relations (populated when fetched)
+  invoice?: Invoice
 }
 
 // Recurring Invoice Schedule (template + monthly cadence)
@@ -963,6 +1103,9 @@ export interface RecurringInvoiceSchedule {
   // Monthly cadence, day-of-month 1-31. Clamped to last day of month in
   // shorter months (handled by computeNextRunDate).
   day_of_month: number
+  // Whole hour (0-23) in Europe/Stockholm time at which the schedule sends.
+  // The hourly cron only fires schedules matching the current Stockholm hour.
+  send_hour: number
   payment_terms_days: number
 
   currency: Currency
@@ -1023,6 +1166,7 @@ export interface TaxRate {
 export interface CreateCustomerInput {
   name: string
   customer_type: CustomerType
+  customer_number?: string | null
   email?: string
   phone?: string
   address_line1?: string
@@ -1032,7 +1176,7 @@ export interface CreateCustomerInput {
   country?: string
   org_number?: string
   vat_number?: string
-  personal_number?: string
+  personal_number?: string | null
   language?: 'sv' | 'en'
   default_payment_terms?: number
   notes?: string
@@ -1104,7 +1248,9 @@ export interface CreateInvoiceInput {
   your_reference?: string
   our_reference?: string
   notes?: string
-  /** Plaintext personnummer — encrypted server-side before storage. */
+  /** Optional https link where the customer can pay online (e.g. a Stripe Payment Link). */
+  payment_link_url?: string
+  /** Plaintext personnummer: encrypted server-side before storage. */
   deduction_personnummer?: string
   /** Fastighetsbeteckning. Required when any item carries deduction_type === 'rot'. */
   deduction_housing_designation?: string
@@ -1263,6 +1409,9 @@ export type JournalEntrySourceType =
   | 'reminder_fee'
   | 'accrual'
   | 'result_appropriation'
+  | 'rot_rut_payout'
+  | 'vat_settlement'
+  | 'stripe_payout'
 
 // Journal entry status
 export type JournalEntryStatus = 'draft' | 'posted' | 'reversed' | 'cancelled'
@@ -1290,6 +1439,9 @@ export interface BASAccount {
   is_active: boolean
   is_system_account: boolean
   default_vat_code: string | null
+  // Per-account default VAT rate for booking lines (0/0.06/0.12/0.25).
+  // null = no default (line keeps its own rate). Öresavrundning (3740) = 0.
+  default_vat_rate: number | null
   description: string | null
   sru_code: string | null
   k2_excluded: boolean
@@ -1364,6 +1516,10 @@ export interface JournalEntryLine {
   exchange_rate: number | null
   line_description: string | null
   tax_code: string | null
+  // SIE dimension map {sie_dim_no: object_code}, e.g. {"1":"KS01","6":"P001"}.
+  // Source of truth; cost_center/project mirror keys '1'/'6'. Optional so
+  // pre-migration fixtures and partial selects stay type-valid.
+  dimensions?: Record<string, string>
   cost_center: string | null
   project: string | null
   sort_order: number
@@ -1475,6 +1631,15 @@ export interface MappingResult {
   vat_lines: VatJournalLine[]
   all_lines_complete?: boolean  // when true, vat_lines contains ALL non-settlement lines
   description: string
+  // Set when a matched counterparty template's learned direction contradicts
+  // the transaction sign (e.g. an incoming refund matching an expense-learned
+  // template). The result is mirrored and review-gated, and must never be
+  // learned back into the template (it would flip the learned accounts).
+  direction_mismatch?: boolean
+  // Dimensions bag applied to the business (expense/revenue) lines of the
+  // generated entry: from a counterparty template's line pattern or an
+  // explicit categorize param (dimensions PR7). Bank/VAT lines stay untagged.
+  dimensions?: Record<string, string>
 }
 
 // VAT journal line (auto-generated)
@@ -1483,6 +1648,9 @@ export interface VatJournalLine {
   debit_amount: number
   credit_amount: number
   description: string
+  // Set on business-type lines materialized from a LinePatternEntry that
+  // carries dimensions (dimensions PR7); VAT/tax lines stay untagged.
+  dimensions?: Record<string, string>
 }
 
 // Categorization template source
@@ -1495,12 +1663,18 @@ export interface LinePatternEntry {
   side: 'debit' | 'credit'
   ratio?: number      // proportion of NON-VAT amount (business + tax ratios sum to ~1.0)
   vat_rate?: number   // applied to FULL amount via rate/(1+rate) (vat type only)
+  // Dimensions bag ({sie_dim_no: code}) learned from the source vouchers'
+  // lines; applied to the materialized line on booking (dimensions PR7).
+  // Only preserved by learning when every occurrence agrees.
+  dimensions?: Record<string, string>
 }
 
 // Per-tenant counterparty-based categorization template
 export interface CategorizationTemplate {
   id: string
-  user_id: string
+  // Pre-multi-tenant relic: nullable since 20260711100000 and never written
+  // by the learning path anymore. Scoping is company_id.
+  user_id: string | null
   company_id: string
   counterparty_name: string
   counterparty_aliases: string[]
@@ -1612,12 +1786,39 @@ export interface BalanceSheetSection {
   subtotal: number
 }
 
+/**
+ * A non-latest fiscal year whose P&L (class 3-8) does not net to zero —
+ * its result was never transferred to equity (omföring av årets resultat
+ * saknas). Every later period that derives its opening balance from prior
+ * class 1-2 lines inherits exactly this residual as a balance-sheet
+ * differens.
+ */
+export interface UntransferredResult {
+  fiscal_period_id: string
+  period_name: string
+  /** Class 3-8 net (credit-positive = profit), rounded to öre. */
+  pl_net: number
+}
+
+/**
+ * Server-built explanation for an unbalanced balance report. The message is
+ * Swedish (user-facing domain messages are Swedish) and names the exact
+ * fiscal years whose results were never moved to equity.
+ */
+export interface BalanceImbalanceDiagnosis {
+  differens: number
+  untransferred_results: UntransferredResult[]
+  message: string
+}
+
 export interface BalanceSheetReport {
   asset_sections: BalanceSheetSection[]
   total_assets: number
   equity_liability_sections: BalanceSheetSection[]
   total_equity_liabilities: number
   period: { start: string; end: string }
+  /** Present only when the report does not balance. */
+  imbalance_diagnosis?: BalanceImbalanceDiagnosis
 }
 
 export interface ResultatrapportRow {
@@ -1643,6 +1844,39 @@ export interface ResultatrapportReport {
   prior_period: { start: string; end: string } | null
 }
 
+// Resultat per projekt/kostnadsställe: value-as-column P&L matrix over one
+// SIE dimension. `code: null` marks the "(Utan dimension)" residual bucket,
+// which is computed as Totalt − tagged columns so every row sums exactly to
+// its resultatrapport counterpart.
+export interface DimensionPnlColumn {
+  code: string | null
+  name: string | null
+}
+
+export interface DimensionPnlRow {
+  account_number: string
+  account_name: string
+  values: number[]
+  total: number
+}
+
+export interface DimensionPnlGroup {
+  class: number
+  class_label: string
+  rows: DimensionPnlRow[]
+  subtotals: number[]
+  subtotal_total: number
+}
+
+export interface DimensionPnlReport {
+  dimension: { sie_dim_no: string; name: string }
+  columns: DimensionPnlColumn[]
+  groups: DimensionPnlGroup[]
+  net_per_column: number[]
+  net_total: number
+  period: { start: string; end: string }
+}
+
 export interface BalansrapportRow {
   account_number: string
   account_name: string
@@ -1666,6 +1900,8 @@ export interface BalansrapportReport {
   beraknat_resultat: number
   is_balanced: boolean
   period: { start: string; end: string }
+  /** Present only when the underlying trial balance does not balance. */
+  imbalance_diagnosis?: BalanceImbalanceDiagnosis
 }
 
 export interface SIEExportOptions {
@@ -1676,7 +1912,7 @@ export interface SIEExportOptions {
   /**
    * When true, omit year-end closing verifikat (source_type = 'year_end')
    * from #VER and from #RES/#UB calculations. Use when handing the file
-   * to systems (e.g. eDeklarera) that do their own closing — including
+   * to systems (e.g. eDeklarera) that do their own closing: including
    * our closing entry would zero out the P&L accounts.
    */
   exclude_year_end_closing?: boolean
@@ -1705,7 +1941,12 @@ export interface CreateJournalEntryLineInput {
   amount_in_currency?: number
   exchange_rate?: number
   tax_code?: string
+  // SIE dimension map {sie_dim_no: object_code}. Wins per key over the
+  // deprecated cost_center/project aliases (normalizeLineDimensions).
+  dimensions?: Record<string, string>
+  /** @deprecated alias for dimensions['1']: kept for API/MCP compatibility */
   cost_center?: string
+  /** @deprecated alias for dimensions['6']: kept for API/MCP compatibility */
   project?: string
 }
 
@@ -1722,6 +1963,9 @@ export type PendingOperationType =
   | 'create_customer'
   | 'create_article'
   | 'update_article'
+  // Kontoplan reference data (gnubok_create_account / gnubok_update_account)
+  | 'create_account'
+  | 'update_account'
   | 'create_supplier'
   | 'create_invoice'
   | 'mark_invoice_paid'
@@ -1746,7 +1990,7 @@ export type PendingOperationType =
   | 'uncategorize_transaction'
   // Document inbox: pin doc to bank transaction
   | 'attach_document_to_transaction'
-  // Link a document directly to a journal entry (verifikation) — for imported/
+  // Link a document directly to a journal entry (verifikation): for imported/
   // manual vouchers that have no bank-transaction row.
   | 'link_document_to_voucher'
   // Manual transaction ingestion (uncategorized row, reversible by delete)
@@ -1762,8 +2006,11 @@ export type PendingOperationType =
   // Phase 4: arbitrary-line bookkeeping primitives
   | 'create_voucher'
   | 'correct_entry'
-  // Pure makulering (storno) of a posted entry — agent-native API plan item 38
+  // Pure makulering (storno) of a posted entry: agent-native API plan item 38
   | 'reverse_entry'
+  // Notes-only annotation on a verifikat: the immutability trigger's carve-out
+  // (migration 20260608120000) makes this legal even on posted entries.
+  | 'set_voucher_note'
   // Bokslut: planenlig avskrivning (one journal entry per asset)
   | 'post_annual_depreciation'
   // Payroll: salary run creation + AGI declaration
@@ -1779,7 +2026,7 @@ export type PendingOperationType =
   // PR #606/#610: bulk-book N bank txs into 1 combined verifikat
   | 'bulk_book_transactions'
   // Bulk-book N selected Underlag (Dokumentinkorgen) against their matched bank
-  // transactions — one verifikat per item, sharing a category + VAT treatment
+  // transactions: one verifikat per item, sharing a category + VAT treatment
   | 'bulk_book_inbox_items'
   // PR #614: link a single bank tx to an already-posted verifikat (no new JE)
   | 'link_transaction_journal_entry'
@@ -1787,6 +2034,23 @@ export type PendingOperationType =
   // (returns a signing link); the user's signature in the browser files it.
   | 'submit_vat_declaration'
   | 'submit_agi'
+  // Dimensions PR3: stage a new dimension value (kostnadsställe/projekt object
+  // code, SIE #OBJEKT): agents never silently mint reporting values.
+  | 'create_dimension_value'
+  // Dimensions PR6: bulk retag of posted-line dimensions via the audited
+  // retag_line_dimensions RPC (gnubok_tag_journal_lines).
+  | 'retag_line_dimensions'
+  // Payroll gap-closure: payslip line edits + absence registration (1.7),
+  // employee master data (1.8; personnummer encrypted at staging), and
+  // cutover opening balances for mid-year migrations (2.4).
+  | 'update_payslip_line'
+  | 'register_absence'
+  | 'create_employee'
+  | 'update_employee'
+  | 'set_employee_opening_balances'
+  // Semesterårsavslut: rolls vacation balances into the next year and may
+  // post a 2920/2940 drift-adjustment verifikation (Phase 3).
+  | 'vacation_year_close'
 export type PendingOperationStatus = 'pending' | 'committing' | 'committed' | 'rejected'
 
 // 'agent_chat' = the in-app AI chat (DB CHECK widened in migration
@@ -1906,11 +2170,12 @@ export type TaxDeadlineType =
   | 'moms_yearly'
   | 'f_skatt'
   | 'arbetsgivardeklaration'
+  | 'skatteinbetalning'
   | 'inkomstdeklaration_ef'
   | 'inkomstdeklaration_ab'
   | 'arsredovisning'
+  | 'arsstamma'
   | 'periodisk_sammanstallning'
-  | 'bokslut'
 
 // Deadline status workflow
 export type DeadlineStatus =
@@ -1953,6 +2218,9 @@ export interface Deadline {
   reminder_offsets: number[] | null
   status: DeadlineStatus
   status_changed_at: string
+  // Durable opt-out for system deadlines: hidden everywhere, never
+  // recreated by the generator or the backfill cron.
+  dismissed_at: string | null
   linked_report_type: string | null
   linked_report_period: Record<string, unknown> | null
 
@@ -2024,6 +2292,7 @@ export type NotificationType =
   | 'receipt_matched'
   | 'invoice_sent'
   | 'missing_underlag'
+  | 'skv_kvittens'
 
 // Notification log entry
 export interface NotificationLog {
@@ -2077,13 +2346,14 @@ export const TAX_DEADLINE_TYPE_LABELS: Record<TaxDeadlineType, string> = {
   moms_monthly: 'Momsdeklaration (månad)',
   moms_quarterly: 'Momsdeklaration (kvartal)',
   moms_yearly: 'Momsdeklaration (år)',
-  f_skatt: 'F-skatt',
+  f_skatt: 'Preliminärskatt (F-skatt)',
   arbetsgivardeklaration: 'Arbetsgivardeklaration',
+  skatteinbetalning: 'Skatteinbetalning (storföretag)',
   inkomstdeklaration_ef: 'Inkomstdeklaration EF',
   inkomstdeklaration_ab: 'Inkomstdeklaration AB',
   arsredovisning: 'Årsredovisning',
-  periodisk_sammanstallning: 'Periodisk sammanställning',
-  bokslut: 'Bokslut'
+  arsstamma: 'Årsstämma',
+  periodisk_sammanstallning: 'Periodisk sammanställning'
 }
 
 // ============================================================
@@ -2149,6 +2419,33 @@ export interface CompanyInbox {
   created_at: string
   updated_at: string
   deprecated_at: string | null
+}
+
+export type CompanyInboundDomainStatus = 'pending' | 'verified' | 'failed'
+
+// A DNS record the user must publish to verify their custom inbound domain
+// (verbatim from the Resend domains API).
+export interface InboundDomainDnsRecord {
+  record: string
+  name: string
+  value: string
+  type: string
+  ttl: string
+  status: string
+  priority?: number
+}
+
+export interface CompanyInboundDomain {
+  id: string
+  company_id: string
+  domain: string
+  status: CompanyInboundDomainStatus
+  resend_domain_id: string | null
+  dns_records: InboundDomainDnsRecord[] | null
+  verified_at: string | null
+  last_checked_at: string | null
+  created_at: string
+  updated_at: string
 }
 
 export interface InvoiceInboxItem {
@@ -2742,7 +3039,7 @@ export interface YearEndResult {
   /**
    * True when the year-open omföring (2099 → 2098) was attempted but threw.
    * The close + IB are already valid and immutable, so the failure is
-   * non-fatal to the year-end itself — but it leaves 2099 carrying the prior
+   * non-fatal to the year-end itself, but it leaves 2099 carrying the prior
    * result into the new period, which is non-compliant. Surfaced so the UI can
    * alert the user (and an alertable log line fires server-side); the
    * retroactive catch-up script (scripts/repair-result-appropriation.ts) then
@@ -2753,7 +3050,7 @@ export interface YearEndResult {
    * IB/UB reconciliation per balance sheet account, computed after the
    * opening balances are posted. Surfaced to the UI's ResultStep so the
    * user can verify continuity before navigating away. Always within
-   * ORE_TOLERANCE — otherwise executeYearEndClosing would have thrown.
+   * ORE_TOLERANCE, otherwise executeYearEndClosing would have thrown.
    */
   continuity?: ContinuityCheckResult
 }
@@ -2779,7 +3076,7 @@ export type DepreciationMethod =
   | 'restvardesavskrivning_25'
 
 /**
- * K3 component (BFNAR 2012:1 ch 17.4 — komponentavskrivning). When a
+ * K3 component (BFNAR 2012:1 ch 17.4: komponentavskrivning). When a
  * substantial asset (typically real estate) has significant components with
  * materially different useful lives, K3 reporting requires each component to
  * be depreciated on its own life rather than treating the asset as a single
@@ -2823,19 +3120,19 @@ export interface Asset {
   disposed_at: string | null
   disposed_proceeds: number | null
   /** Output VAT on disposal proceeds (ML 3 kap 3 § / 7 kap 3 §). Defaults to
-   *  0 — only nonzero when the sale was momspliktig. The VAT account
+   *  0: only nonzero when the sale was momspliktig. The VAT account
    *  (2611/2621/2631) is derived from disposed_vat_treatment. */
   disposed_proceeds_vat: number
   /** VAT treatment applied to disposal proceeds. Null for legacy disposals
    *  without VAT data. Constrained by DB CHECK to the same enum as
    *  VatTreatment. */
   disposed_vat_treatment: VatTreatment | null
-  /** Jämkning amount per ML 8a kap 7 § — input VAT paid back on disposal
+  /** Jämkning amount per ML 8a kap 7 §: input VAT paid back on disposal
    *  inside the correction period. Defaults to 0; positive number = debt
    *  to the state booked on 2641 credit. */
   jamkning_amount: number
   /** Remaining months in the korrigeringstid at disposal date. Audit
-   *  metadata only — the booking sits on the journal entry. */
+   *  metadata only: the booking sits on the journal entry. */
   jamkning_remaining_months: number | null
   /** Total korrigeringstid in months: 60 (lös egendom) or 120 (fastighet /
    *  markanläggning). Audit metadata. */
@@ -2988,7 +3285,7 @@ export interface RawTransaction {
   import_source?: string
   /**
    * Counterparty IBAN from PSD2 (creditor for outflows, debtor for inflows).
-   * Used by the own-account transfer detector — when this matches another
+   * Used by the own-account transfer detector: when this matches another
    * cash_accounts row for the same company, both legs auto-book as a transfer.
    */
   counterparty_iban?: string | null
@@ -3029,13 +3326,13 @@ export interface IngestResult {
   /**
    * SHADOW-MODE counter: rows that an enforcing same-feed scope-drift dedup rule
    * WOULD have treated as re-imports (IBAN-drift re-imports the external_id
-   * check misses). These are still imported — the field only measures how often
+   * check misses). These are still imported: the field only measures how often
    * the rule would fire, so it can be validated on real data before enforcement.
    */
   shadow_scope_drift_candidates?: number
   /**
    * SHADOW-MODE counter: rows that an enforcing date-drift dedup rule WOULD have
-   * treated as re-imports — a twin with the same öre and an account-compatible,
+   * treated as re-imports: a twin with the same öre and an account-compatible,
    * bridging (or cross-channel count-symmetric) match one day away, which the
    * exact-date content bridge misses. Still imported; the field only measures
    * how often the rule would fire, for validation before any enforcement.
@@ -3060,7 +3357,7 @@ export interface InvoiceExtractionResult {
     dueDate: string | null
     paymentReference: string | null
     currency: string
-    // Service/coverage window the invoice charges for — drives the
+    // Service/coverage window the invoice charges for: drives the
     // periodisering prefill. Optional: extractions from before the field
     // existed lack it.
     servicePeriodStart?: string | null
@@ -3210,6 +3507,11 @@ export interface Employee {
   vacation_days_per_year: number
   vacation_days_saved: number
   semestertillagg_rate: number
+  // Arbetsschema-lite: weekly schedule driving the hourly/daily divisors
+  // (173/21 at the defaults). employment_degree keeps prorating base salary;
+  // these ONLY drive divisors.
+  hours_per_week: number
+  workdays_per_week: number
   email: string | null
   phone: string | null
   address_line1: string | null
@@ -3219,6 +3521,10 @@ export interface Employee {
   vaxa_stod_eligible: boolean
   vaxa_stod_start: string | null
   vaxa_stod_end: string | null
+  // Dimensions PR8: bag ({sie_dim_no: code}) applied to this employee's P&L
+  // cost lines when a salary run is booked. jsonb DEFAULT '{}'. Optional in
+  // TS for pre-migration fixtures.
+  default_dimensions?: Record<string, string>
   is_active: boolean
   created_at: string
   updated_at: string

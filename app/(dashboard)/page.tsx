@@ -29,16 +29,20 @@ export default async function DashboardPage() {
   const rawCompanyId = cookieStore.get('gnubok-company-id')?.value
     ?? await getActiveCompanyId(supabase, user.id)
 
-  // Validate the cookie/preference points to a company the user can access
+  // Validate the cookie/preference points to a company the user can access.
+  // Only a positive "no membership row" clears it: a FAILED query means the
+  // membership is unknown, and treating that as absent bounced onboarded
+  // users to the wizard on transient failures (issue #1053). RLS still
+  // guards every downstream query if the cookie is stale.
   let companyId = rawCompanyId
   if (companyId) {
-    const { data: membership } = await supabase
+    const { data: membership, error: membershipError } = await supabase
       .from('company_members')
       .select('company_id')
       .eq('company_id', companyId)
       .eq('user_id', user.id)
       .maybeSingle()
-    if (!membership) companyId = null
+    if (!membership && !membershipError) companyId = null
   }
 
   if (!companyId) {
@@ -54,7 +58,7 @@ export default async function DashboardPage() {
 
   // Fetch all data in parallel
   const [
-    { data: settings },
+    settingsRes,
     { count: customerCount },
     { count: invoiceCount },
     { count: receiptCount },
@@ -71,7 +75,7 @@ export default async function DashboardPage() {
     worklist,
     suggestedMatches,
   ] = await Promise.all([
-    supabase.from('company_settings').select('*').eq('company_id', companyId).single(),
+    supabase.from('company_settings').select('*').eq('company_id', companyId).maybeSingle(),
     supabase.from('customers').select('*', { count: 'exact', head: true }).eq('company_id', companyId),
     supabase.from('invoices').select('*', { count: 'exact', head: true }).eq('company_id', companyId),
     supabase.from('receipts').select('*', { count: 'exact', head: true }).eq('company_id', companyId),
@@ -83,22 +87,31 @@ export default async function DashboardPage() {
       .gte('journal_entry.entry_date', startOfYearStr),
     supabase.from('invoices').select('total, total_sek, vat_amount, vat_amount_sek, status, ore_rounding').eq('company_id', companyId).in('status', ['sent', 'overdue']).is('credited_invoice_id', null),
     supabase.from('bank_connections').select('id, accounts_data, status, consent_expires, bank_name').eq('company_id', companyId).eq('status', 'active'),
-    supabase.from('deadlines').select('*, customer:customers(id, name)').eq('company_id', companyId).eq('is_completed', false)
+    supabase.from('deadlines').select('*, customer:customers(id, name)').eq('company_id', companyId).eq('is_completed', false).is('dismissed_at', null)
       .or(`due_date.lt.${today},due_date.lte.${nextWeek}`).order('due_date', { ascending: true }),
     supabase.from('sie_imports').select('*', { count: 'exact', head: true }).eq('company_id', companyId).eq('status', 'completed'),
     supabase.from('transactions').select('*', { count: 'exact', head: true }).eq('company_id', companyId).is('journal_entry_id', null).eq('is_ignored', false).is('is_business', null).lt('date', new Date(now.getTime() - 14 * 24 * 60 * 60 * 1000).toISOString().split('T')[0]),
     // Skatteverket tokens are user-scoped (one BankID identity per user) but
-    // carry the active company_id; either filter would work — we use user_id
+    // carry the active company_id; either filter would work: we use user_id
     // because that's what the token-store reads/writes against.
     supabase.from('skatteverket_tokens').select('*', { count: 'exact', head: true }).eq('user_id', user.id),
     supabase.from('agent_profiles').select('verified_at').eq('company_id', companyId).maybeSingle(),
     // Any posted entry counts as "company has been used" for the hasData gate.
     supabase.from('journal_entries').select('*', { count: 'exact', head: true }).eq('company_id', companyId).eq('status', 'posted'),
-    // Pending-work counts + suggested matches come from lib/worklist — the
+    // Pending-work counts + suggested matches come from lib/worklist: the
     // same source as the sidebar badges, so the numbers can never diverge.
     getWorklistCounts(supabase, companyId),
     listSuggestedMatches(supabase, companyId, 5),
   ])
+
+  // A FAILED settings read must not masquerade as "onboarding not done":
+  // that sent fully onboarded users back to the wizard on a transient query
+  // failure (issue #1053). Throw to the error boundary (retryable) and only
+  // redirect on a genuinely incomplete or missing settings row.
+  const { data: settings, error: settingsError } = settingsRes
+  if (settingsError) {
+    throw new Error(`company_settings fetch failed: ${settingsError.message}`)
+  }
 
   // If onboarding is not complete, redirect to onboarding
   if (!settings?.onboarding_complete) {
@@ -123,7 +136,7 @@ export default async function DashboardPage() {
   const agentBuilt = Boolean(effectiveAgentVerified)
 
   // "Has the company already been used?" Any real business data means we must
-  // NOT hijack the dashboard with the full-screen onboarding gate — existing
+  // NOT hijack the dashboard with the full-screen onboarding gate: existing
   // and migrated users get the normal Översikt with a build-assistant prompt
   // in the hero slot (see DashboardContent's agentBuilt branch) instead.
   const hasData =
@@ -169,10 +182,10 @@ export default async function DashboardPage() {
     for (const line of filtered) {
       const acct = line.account_number
       if (acct.startsWith('3')) {
-        // Revenue: class 3 — credit-normal accounts
+        // Revenue: class 3, credit-normal accounts
         revenue += Math.round(((line.credit_amount || 0) - (line.debit_amount || 0)) * 100) / 100
       } else if (acct.startsWith('4') || acct.startsWith('5') || acct.startsWith('6') || acct.startsWith('7')) {
-        // Expenses: classes 4-7 — debit-normal accounts
+        // Expenses: classes 4-7, debit-normal accounts
         expenses += Math.round(((line.debit_amount || 0) - (line.credit_amount || 0)) * 100) / 100
       }
     }

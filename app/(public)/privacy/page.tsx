@@ -45,6 +45,7 @@ export default function PrivacyPolicyPage() {
             <ul>
               <li><strong>Kontouppgifter:</strong> E-postadress (för inloggning)</li>
               <li><strong>Företagsuppgifter:</strong> Företagsnamn, organisationsnummer, adress, kontaktuppgifter</li>
+              <li><strong>Kundidentitet:</strong> Personnummer för privatkunder när det behövs för avtal eller fakturering</li>
               <li><strong>Bokföringsdata:</strong> Verifikationer, fakturor, kvitton, transaktioner, kontoplaner</li>
               <li><strong>Bankdata:</strong> Kontosaldon och transaktioner (via PSD2-koppling)</li>
               <li><strong>Dokument:</strong> Uppladdade kvitton, fakturor och andra bokföringsunderlag</li>
@@ -132,12 +133,12 @@ export default function PrivacyPolicyPage() {
                     <td className="py-2 pr-4">
                       AI-inferens (kategorisering samt dokument- och
                       kvittotolkning) via Amazon Bedrock. Bearbetar bokföringsdata
-                      och uppladdade underlag — endast när AI-funktioner är
+                      och uppladdade underlag: endast när AI-funktioner är
                       aktiverade.
                     </td>
                     <td className="py-2 pr-4">EU (eu-north-1, Stockholm)</td>
                     <td className="py-2">
-                      EU-baserad inferens — ingen tredjelandsöverföring. DPA, SCC
+                      EU-baserad inferens: ingen tredjelandsöverföring. DPA, SCC
                       och DPF-certifiering. Prompter lagras ej efter anropet och
                       används ej till modellträning.
                     </td>
@@ -164,7 +165,7 @@ export default function PrivacyPolicyPage() {
 
             <p className="mt-4 text-sm text-muted-foreground">
               AI-funktioner är frivilliga och kräver separat samtycke före
-              aktivering — data skickas först när du aktivt godkänner
+              aktivering: data skickas först när du aktivt godkänner
               användningen. AI:t använder Anthropics Claude-modeller men körs
               inom Amazon Bedrock i EU (eu-north-1, Stockholm); datan lämnar
               alltså inte EU och delas inte med Anthropic. Kärntjänsten
@@ -202,6 +203,10 @@ export default function PrivacyPolicyPage() {
               <li>
                 <strong>Kontouppgifter:</strong> Så länge kontot är aktivt, plus 30 dagar efter
                 begäran om radering (för att hantera pågående bokföringsplikter).
+              </li>
+              <li>
+                <strong>Kundidentitet:</strong> Under kundrelationen, eller i sju år när uppgiften
+                ingår i räkenskapsinformation som måste bevaras.
               </li>
               <li>
                 <strong>Tekniska loggar:</strong> Maximalt 90 dagar.

@@ -6,6 +6,16 @@ import {
 } from '@/tests/helpers'
 import { AccountsNotInChartError } from '@/lib/bookkeeping/errors'
 
+const { mockLoggerWarn } = vi.hoisted(() => ({ mockLoggerWarn: vi.fn() }))
+vi.mock('@/lib/logger', () => ({
+  createLogger: () => ({
+    info: vi.fn(),
+    warn: mockLoggerWarn,
+    error: vi.fn(),
+    child: vi.fn().mockReturnThis(),
+  }),
+}))
+
 const { supabase: mockSupabase, enqueue, reset } = createQueuedMockSupabase()
 vi.mock('@/lib/supabase/server', () => ({
   createClient: () => Promise.resolve(mockSupabase),
@@ -75,7 +85,12 @@ function makeReq() {
 }
 
 function enqueueHappyPath(opts: {
-  transaction: { amount: number; currency: string; amount_sek?: number | null }
+  transaction: {
+    amount: number
+    currency: string
+    amount_sek?: number | null
+    cash_account_id?: string | null
+  }
   invoice: {
     currency: string
     exchange_rate?: number | null
@@ -84,6 +99,9 @@ function enqueueHappyPath(opts: {
     status?: string
   }
   accountingMethod?: string
+  // ledger_account returned by the cash_accounts lookup; only enqueued when
+  // the transaction carries a cash_account_id.
+  cashAccountLedger?: string
 }) {
   // 1. transactions fetch
   enqueue({
@@ -94,6 +112,7 @@ function enqueueHappyPath(opts: {
       currency: opts.transaction.currency,
       amount_sek: opts.transaction.amount_sek ?? null,
       supplier_invoice_id: null,
+      cash_account_id: opts.transaction.cash_account_id ?? null,
       date: '2026-05-12',
     },
     error: null,
@@ -114,19 +133,23 @@ function enqueueHappyPath(opts: {
   })
   // 3. company_settings fetch
   enqueue({ data: { accounting_method: opts.accountingMethod ?? 'accrual' }, error: null })
-  // 4. supplier_invoices update (CAS)
+  // 4. cash_accounts lookup (only when the transaction is linked to one)
+  if (opts.transaction.cash_account_id) {
+    enqueue({ data: { ledger_account: opts.cashAccountLedger ?? '1930' }, error: null })
+  }
+  // 5. supplier_invoices update (CAS)
   enqueue({ data: [{ id: SI_UUID }], error: null })
-  // 5. supplier_invoice_payments insert
+  // 6. supplier_invoice_payments insert
   enqueue({ data: null, error: null })
-  // 6. transactions update (link)
+  // 7. transactions update (link)
   enqueue({ data: null, error: null })
 }
 
-describe('POST /api/transactions/[id]/match-supplier-invoice — FX residual', () => {
+describe('POST /api/transactions/[id]/match-supplier-invoice: FX residual', () => {
   it('books a clean SEK clearing entry (no FX) for a SEK tx paying a SEK invoice', async () => {
     // SEK/SEK now routes through buildSupplierPaymentClearingLines +
     // createJournalEntry, not createSupplierInvoicePaymentEntry. An exact
-    // payment yields just Dr 2440 / Cr 1930 — no 3960/7960 FX line, no 3740.
+    // payment yields just Dr 2440 / Cr 1930: no 3960/7960 FX line, no 3740.
     enqueueHappyPath({
       transaction: { amount: -2390, currency: 'SEK' },
       invoice: { currency: 'SEK', remaining_amount: 2390 },
@@ -202,7 +225,216 @@ describe('POST /api/transactions/[id]/match-supplier-invoice — FX residual', (
   })
 })
 
-describe('POST /api/transactions/[id]/match-supplier-invoice — non-FX paths', () => {
+describe('POST /api/transactions/[id]/match-supplier-invoice: settlement account resolution', () => {
+  // Regression for a real misbooking: a company whose last few supplier
+  // invoices were paid privately (mark-paid sets company_settings
+  // .last_supplier_payment_account = '2893') later matched a genuine bank
+  // transaction to a supplier invoice. The route used to default
+  // paymentAccount from that sticky setting, so the payment credited 2893
+  // (shareholder loan) instead of the transaction's real 1930 bank account.
+  it('credits the account this transaction is linked to, even with a stale last_supplier_payment_account on file', async () => {
+    enqueue({
+      data: {
+        id: TX_UUID,
+        company_id: 'company-1',
+        amount: -1001,
+        currency: 'SEK',
+        amount_sek: null,
+        supplier_invoice_id: null,
+        cash_account_id: 'ca-1930',
+        date: '2026-02-01',
+      },
+      error: null,
+    })
+    enqueue({
+      data: {
+        id: SI_UUID,
+        currency: 'SEK',
+        exchange_rate: null,
+        status: 'registered',
+        remaining_amount: 1001,
+        paid_amount: 0,
+        supplier: { supplier_type: 'swedish_business' },
+        items: [],
+      },
+      error: null,
+    })
+    // Stale sticky setting from an earlier private-funds payment: must be
+    // ignored now that the route no longer selects it.
+    enqueue({ data: { accounting_method: 'accrual', last_supplier_payment_account: '2893' }, error: null })
+    enqueue({ data: { ledger_account: '1930' }, error: null }) // cash_accounts lookup
+    enqueue({ data: [{ id: SI_UUID }], error: null })
+    enqueue({ data: null, error: null })
+    enqueue({ data: null, error: null })
+
+    await POST(makeReq(), createMockRouteParams({ id: TX_UUID }))
+
+    expect(mockCreateJournalEntry).toHaveBeenCalledTimes(1)
+    const input = mockCreateJournalEntry.mock.calls[0][3] as {
+      lines: Array<{ account_number: string; debit_amount: number; credit_amount: number }>
+    }
+    expect(input.lines.find((l) => l.account_number === '1930')?.credit_amount).toBe(1001)
+    expect(input.lines.some((l) => l.account_number === '2893')).toBe(false)
+  })
+
+  it('credits the transaction\'s own linked cash account when it is not the primary 1930', async () => {
+    enqueue({
+      data: {
+        id: TX_UUID,
+        company_id: 'company-1',
+        amount: -500,
+        currency: 'SEK',
+        amount_sek: null,
+        supplier_invoice_id: null,
+        cash_account_id: 'ca-1940',
+        date: '2026-02-01',
+      },
+      error: null,
+    })
+    enqueue({
+      data: {
+        id: SI_UUID,
+        currency: 'SEK',
+        exchange_rate: null,
+        status: 'registered',
+        remaining_amount: 500,
+        paid_amount: 0,
+        supplier: { supplier_type: 'swedish_business' },
+        items: [],
+      },
+      error: null,
+    })
+    enqueue({ data: { accounting_method: 'accrual' }, error: null })
+    enqueue({ data: { ledger_account: '1940' }, error: null }) // cash_accounts lookup
+    enqueue({ data: [{ id: SI_UUID }], error: null })
+    enqueue({ data: null, error: null })
+    enqueue({ data: null, error: null })
+
+    await POST(makeReq(), createMockRouteParams({ id: TX_UUID }))
+
+    const input = mockCreateJournalEntry.mock.calls[0][3] as {
+      lines: Array<{ account_number: string; debit_amount: number; credit_amount: number }>
+    }
+    expect(input.lines.find((l) => l.account_number === '1940')?.credit_amount).toBe(500)
+  })
+
+  it('defaults to 1930 when the transaction has no linked cash account', async () => {
+    enqueueHappyPath({
+      transaction: { amount: -750, currency: 'SEK' },
+      invoice: { currency: 'SEK', remaining_amount: 750 },
+    })
+    await POST(makeReq(), createMockRouteParams({ id: TX_UUID }))
+    const input = mockCreateJournalEntry.mock.calls[0][3] as {
+      lines: Array<{ account_number: string; debit_amount: number; credit_amount: number }>
+    }
+    expect(input.lines.find((l) => l.account_number === '1930')?.credit_amount).toBe(750)
+  })
+
+  it('aborts with 500 BOOKKEEPING_DATABASE_ERROR (mutates nothing) when the cash_accounts lookup errors', async () => {
+    // Regression: an explicit cash_account_id almost certainly resolves to a
+    // non-1930 account, so a transient lookup failure must not silently
+    // degrade to 1930 (same misbooking risk this whole fix exists to close,
+    // just triggered by infra flakiness instead of a stale setting). The
+    // request should fail before any state mutation, not book to a guessed
+    // account.
+    enqueue({
+      data: {
+        id: TX_UUID,
+        company_id: 'company-1',
+        amount: -600,
+        currency: 'SEK',
+        amount_sek: null,
+        supplier_invoice_id: null,
+        cash_account_id: 'ca-broken',
+        date: '2026-02-01',
+      },
+      error: null,
+    })
+    enqueue({
+      data: {
+        id: SI_UUID,
+        currency: 'SEK',
+        exchange_rate: null,
+        status: 'registered',
+        remaining_amount: 600,
+        paid_amount: 0,
+        supplier: { supplier_type: 'swedish_business' },
+        items: [],
+      },
+      error: null,
+    })
+    enqueue({ data: { accounting_method: 'accrual' }, error: null })
+    enqueue({ data: null, error: { message: 'connection reset' } }) // cash_accounts lookup errors
+
+    const res = await POST(makeReq(), createMockRouteParams({ id: TX_UUID }))
+    const { status, body } = await parseJsonResponse<{ error: { code: string } }>(res)
+
+    expect(status).toBe(500)
+    expect(body.error.code).toBe('BOOKKEEPING_DATABASE_ERROR')
+    expect(mockCreateJournalEntry).not.toHaveBeenCalled()
+  })
+})
+
+describe('POST /api/transactions/[id]/match-supplier-invoice: settlement account on FX and cash-method branches', () => {
+  // Regression locks for #1000: the FX branch (createSupplierInvoicePaymentEntry)
+  // and cash-method branch (createSupplierInvoiceCashEntry) must receive the
+  // resolved settlement account, not fall back to their internal 1930 default
+  // whenever the transaction is linked to a different cash account.
+  it('FX branch: passes the linked non-1930 account to createSupplierInvoicePaymentEntry', async () => {
+    enqueueHappyPath({
+      transaction: { amount: -2400, currency: 'SEK', cash_account_id: 'ca-1940' },
+      invoice: { currency: 'EUR', exchange_rate: 10.6254, remaining_amount: 225 },
+      cashAccountLedger: '1940',
+    })
+    const res = await POST(makeReq(), createMockRouteParams({ id: TX_UUID }))
+    expect(res.status).toBe(200)
+    expect(mockCreatePaymentEntry).toHaveBeenCalledTimes(1)
+    const args = mockCreatePaymentEntry.mock.calls[0]
+    // Confirm the FX branch actually ran: booked 2390.72, paid 2400 -> loss 9.28.
+    expect(args[6]).toBeCloseTo(-9.28, 2)
+    expect(args[8]).toBe('1940')
+  })
+
+  it('FX branch: falls back to 1930 when the transaction has no linked cash account', async () => {
+    enqueueHappyPath({
+      transaction: { amount: -2400, currency: 'SEK' },
+      invoice: { currency: 'EUR', exchange_rate: 10.6254, remaining_amount: 225 },
+    })
+    const res = await POST(makeReq(), createMockRouteParams({ id: TX_UUID }))
+    expect(res.status).toBe(200)
+    expect(mockCreatePaymentEntry.mock.calls[0][8]).toBe('1930')
+  })
+
+  it('cash-method branch: passes the linked non-1930 account to createSupplierInvoiceCashEntry', async () => {
+    enqueueHappyPath({
+      transaction: { amount: -500, currency: 'SEK', cash_account_id: 'ca-1940' },
+      invoice: { currency: 'SEK', remaining_amount: 500 },
+      accountingMethod: 'cash',
+      cashAccountLedger: '1940',
+    })
+    const res = await POST(makeReq(), createMockRouteParams({ id: TX_UUID }))
+    expect(res.status).toBe(200)
+    expect(mockCreateCashEntry).toHaveBeenCalledTimes(1)
+    expect(mockCreatePaymentEntry).not.toHaveBeenCalled()
+    const args = mockCreateCashEntry.mock.calls[0]
+    expect(args[8]).toBe('1940')
+    // Pure SEK settlement: no settledBankSek override.
+    expect(args[9]).toBeUndefined()
+  })
+
+  it('cash-method branch: falls back to 1930 when the transaction has no linked cash account', async () => {
+    enqueueHappyPath({
+      transaction: { amount: -500, currency: 'SEK' },
+      invoice: { currency: 'SEK', remaining_amount: 500 },
+      accountingMethod: 'cash',
+    })
+    const res = await POST(makeReq(), createMockRouteParams({ id: TX_UUID }))
+    expect(res.status).toBe(200)
+    expect(mockCreateCashEntry.mock.calls[0][8]).toBe('1930')
+  })
+})
+
+describe('POST /api/transactions/[id]/match-supplier-invoice: non-FX paths', () => {
   it('returns 200 with the expected body shape on the happy path', async () => {
     enqueueHappyPath({
       transaction: { amount: -1000, currency: 'SEK' },
@@ -311,11 +543,11 @@ describe('POST /api/transactions/[id]/match-supplier-invoice — non-FX paths', 
   })
 })
 
-describe('POST /api/transactions/[id]/match-supplier-invoice — cash method + FX', () => {
+describe('POST /api/transactions/[id]/match-supplier-invoice: cash method + FX', () => {
   it('full cross-currency settlement books at the payment rate (no FX-unsupported error)', async () => {
     // Cash method, SEK account paying a 25 USD invoice. The invoice's stored
     // rate (9.20 → 230 SEK) differs from the 239 SEK that actually left the
-    // bank — previously this was blocked. It must now succeed and hand the
+    // bank: previously this was blocked. It must now succeed and hand the
     // cash builder the real bank SEK so 1930 matches the bank line.
     enqueueHappyPath({
       transaction: { amount: -239, currency: 'SEK' },
@@ -357,13 +589,13 @@ describe('POST /api/transactions/[id]/match-supplier-invoice — cash method + F
     const res = await POST(makeReq(), createMockRouteParams({ id: TX_UUID }))
     expect(res.status).toBe(200)
     expect(mockCreateCashEntry).toHaveBeenCalledTimes(1)
-    // No bogus settledBankSek=19 override — the builder uses the invoice rate.
+    // No bogus settledBankSek=19 override: the builder uses the invoice rate.
     expect(mockCreateCashEntry.mock.calls[0][9]).toBeUndefined()
   })
 
   it('PARTIAL foreign payment under the cash method is still rejected', async () => {
     // Paying only 10 of 19 USD remaining. The cash builder books the whole
-    // invoice, so a partial bank amount cannot pin the entry — still blocked.
+    // invoice, so a partial bank amount cannot pin the entry: still blocked.
     enqueueHappyPath({
       transaction: { amount: -10, currency: 'USD', amount_sek: -92.25 },
       invoice: { currency: 'USD', exchange_rate: 9.20, remaining_amount: 19 },
@@ -376,7 +608,7 @@ describe('POST /api/transactions/[id]/match-supplier-invoice — cash method + F
     expect(mockCreateCashEntry).not.toHaveBeenCalled()
   })
 
-  it('does NOT absorb öre under the cash method — a SEK sub-krona diff stays partial', async () => {
+  it('does NOT absorb öre under the cash method: a SEK sub-krona diff stays partial', async () => {
     // Kontantmetoden books the full invoice via the cash entry (not the bank
     // amount), so folding the 0,25 to 3740 would hide a 1930 discrepancy. The
     // öre band is accrual-only; here the invoice stays partially_paid.
@@ -398,14 +630,13 @@ describe('POST /api/transactions/[id]/match-supplier-invoice — cash method + F
   })
 })
 
-describe('POST /api/transactions/[id]/match-supplier-invoice — payment JE failure aborts', () => {
-  // Regression: the route used to catch a JE-creation failure and proceed —
-  // marking the invoice paid with NO payment voucher. That half-state is
+describe('POST /api/transactions/[id]/match-supplier-invoice: payment JE failure aborts', () => {
+  // Regression: the route used to catch a JE-creation failure and proceed:   // marking the invoice paid with NO payment voucher. That half-state is
   // unrecoverable (mark-paid rejects 'paid', match rejects linked txs), so a
   // failed voucher must now fail the whole match before any state mutation.
 
   it('returns 500 MATCH_SI_JE_FAILED and mutates nothing when the engine throws (pure-SEK path)', async () => {
-    // Only the 3 reads enqueued — if the route (incorrectly) proceeded to the
+    // Only the 3 reads enqueued: if the route (incorrectly) proceeded to the
     // invoice update, the empty queue would surface as MATCH_SI_NOT_OPEN.
     enqueueHappyPath({
       transaction: { amount: -29890, currency: 'SEK' },

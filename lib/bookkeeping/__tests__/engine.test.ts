@@ -26,7 +26,7 @@ vi.mock('@/lib/events', () => ({
   eventBus: { emit: vi.fn().mockResolvedValue([]) },
 }))
 
-// Mock the on-demand BAS backfill — default: nothing seedable. Individual
+// Mock the on-demand BAS backfill, default: nothing seedable. Individual
 // tests override per scenario.
 const mockBackfill = vi.fn().mockResolvedValue([])
 vi.mock('@/lib/bookkeeping/account-backfill', () => ({
@@ -107,7 +107,7 @@ describe('getSwedishLocalDate', () => {
   })
 })
 
-describe('createDraftEntry — cancelled status on line-insert failure', () => {
+describe('createDraftEntry: cancelled status on line-insert failure', () => {
   it('sets status to cancelled (not delete) when line insert fails', async () => {
     const updateMock = vi.fn().mockReturnValue({ eq: vi.fn().mockResolvedValue({ error: null }) })
 
@@ -182,7 +182,7 @@ describe('createDraftEntry — cancelled status on line-insert failure', () => {
   })
 })
 
-describe('createDraftEntry — date/period cross-validation', () => {
+describe('createDraftEntry: date/period cross-validation', () => {
   function buildSupabase(periodData: { name: string; period_start: string; period_end: string } | null) {
     return {
       from: vi.fn().mockImplementation((table: string) => {
@@ -362,7 +362,7 @@ describe('JournalEntryStatus type includes cancelled', () => {
   })
 })
 
-describe('createDraftEntry — on-demand BAS account backfill', () => {
+describe('createDraftEntry: on-demand BAS account backfill', () => {
   // Engine seeds standard BAS accounts missing from the chart instead of
   // failing (June 2026 incident: 3740 öresavrundning missing → payment
   // voucher dead end). Non-seedable numbers still throw.
@@ -484,7 +484,7 @@ describe('createDraftEntry — on-demand BAS account backfill', () => {
   })
 })
 
-describe('reverseEntry — entry_date defaults to original entry date', () => {
+describe('reverseEntry: entry_date defaults to original entry date', () => {
   it('uses original entry_date when no reversalDate is provided', async () => {
     const original = {
       id: 'entry-1',
@@ -612,7 +612,7 @@ describe('reverseEntry — entry_date defaults to original entry date', () => {
   })
 })
 
-describe('reverseEntry — rejects reversing a storno or correction', () => {
+describe('reverseEntry: rejects reversing a storno or correction', () => {
   // BFL 5 kap 5§: a storno-of-a-storno makes the original verifikat's
   // cancellation chain ambiguous. The UI hides "Återför" for these source
   // types; the engine is the server-side backstop against a direct API call.
@@ -655,13 +655,13 @@ describe('reverseEntry — rejects reversing a storno or correction', () => {
         reverseEntry(supabase as never, 'company-1', 'user-1', 'entry-1'),
       ).rejects.toBeInstanceOf(CannotReverseStornoError)
 
-      // No reversal was written — the guard fires before any voucher number is drawn.
+      // No reversal was written: the guard fires before any voucher number is drawn.
       expect(supabase.rpc).not.toHaveBeenCalled()
     })
   }
 })
 
-describe('reverseEntry — bank transaction unlink', () => {
+describe('reverseEntry: bank transaction unlink', () => {
   // After a reversal the booked bank transaction must return to "Att bokföra"
   // (journal_entry_id cleared) so the user can book it again. The agent paths
   // in lib/pending-operations/commit.ts did this manually; the engine now owns
@@ -748,5 +748,124 @@ describe('reverseEntry — bank transaction unlink', () => {
     expect(result.id).toBe('reversal-1')
     expect(txUpdatePayloads).toEqual([{ journal_entry_id: null }])
     expect(txFilters).toMatchObject({ company_id: 'company-1', journal_entry_id: 'entry-1' })
+  })
+})
+
+describe('reverseEntry: opening balance unlink', () => {
+  // Reversing a period's IB verifikat must also drop the period's pointer to
+  // it. getOpeningBalances() reads the linked entry's lines with no status
+  // filter, so a still-linked cancelled IB keeps showing in the Balansrapport,
+  // and year-end refuses to run while the pointer is non-null: the storno its
+  // own error message asks for could never satisfy it. See engine.pg.test.ts
+  // for why the flag must fall before the pointer.
+  function buildSupabase(sourceType: string) {
+    const original = {
+      id: 'entry-1',
+      company_id: 'company-1',
+      status: 'posted',
+      fiscal_period_id: 'period-1',
+      voucher_series: 'A',
+      voucher_number: 1,
+      entry_date: '2026-01-01',
+      description: 'Ingående balanser från SIE-import',
+      source_type: sourceType,
+      source_id: null,
+      lines: [
+        { account_number: '1930', debit_amount: 1000, credit_amount: 0 },
+        { account_number: '2350', debit_amount: 0, credit_amount: 1000 },
+      ],
+    }
+    const reversal = { id: 'reversal-1', reverses_id: 'entry-1', source_type: 'storno' }
+
+    let jeCall = 0
+    const jeResults = [
+      { data: original, error: null },
+      { data: reversal, error: null },
+      { data: null, error: null },
+      { data: [{ id: 'entry-1' }], error: null },
+      { data: { ...reversal, lines: [] }, error: null },
+    ]
+    function jeBuilder() {
+      const b: Record<string, unknown> = {}
+      for (const m of ['select', 'eq', 'in', 'update', 'insert']) {
+        b[m] = vi.fn().mockReturnValue(b)
+      }
+      b.single = vi.fn().mockImplementation(async () => jeResults[jeCall++])
+      b.then = (resolve: (v: unknown) => void) => resolve(jeResults[jeCall++])
+      return b
+    }
+
+    const fpUpdates: unknown[] = []
+    const fpFilters: Record<string, unknown>[] = []
+
+    const supabase = {
+      rpc: vi.fn().mockResolvedValue({ data: 2, error: null }),
+      from: vi.fn().mockImplementation((table: string) => {
+        if (table === 'journal_entries') return jeBuilder()
+        if (table === 'chart_of_accounts') {
+          const b: Record<string, unknown> = {}
+          for (const m of ['select', 'eq', 'in']) b[m] = vi.fn().mockReturnValue(b)
+          b.then = (resolve: (v: unknown) => void) =>
+            resolve({
+              data: [
+                { id: 'acc-1930', account_number: '1930' },
+                { id: 'acc-2350', account_number: '2350' },
+              ],
+              error: null,
+            })
+          return b
+        }
+        if (table === 'journal_entry_lines') {
+          return { insert: vi.fn().mockResolvedValue({ error: null }) }
+        }
+        if (table === 'fiscal_periods') {
+          const b: Record<string, unknown> = {}
+          const filters: Record<string, unknown> = {}
+          b.update = vi.fn().mockImplementation((payload: unknown) => {
+            fpUpdates.push(payload)
+            fpFilters.push(filters)
+            return b
+          })
+          b.eq = vi.fn().mockImplementation((col: string, val: unknown) => {
+            filters[col] = val
+            return b
+          })
+          b.then = (resolve: (v: unknown) => void) => resolve({ error: null })
+          return b
+        }
+        if (table === 'transactions') {
+          const b: Record<string, unknown> = {}
+          for (const m of ['update', 'eq']) b[m] = vi.fn().mockReturnValue(b)
+          b.then = (resolve: (v: unknown) => void) => resolve({ error: null })
+          return b
+        }
+        return createMockChain()
+      }),
+    }
+
+    return { supabase, fpUpdates, fpFilters }
+  }
+
+  it('clears the period IB link, flag before pointer, for an opening_balance entry', async () => {
+    const { supabase, fpUpdates, fpFilters } = buildSupabase('opening_balance')
+
+    const result = await reverseEntry(supabase as never, 'company-1', 'user-1', 'entry-1')
+
+    expect(result.id).toBe('reversal-1')
+    // Order matters: enforce_opening_balance_immutability rejects the pointer
+    // write while opening_balances_set is still true.
+    expect(fpUpdates).toEqual([{ opening_balances_set: false }, { opening_balance_entry_id: null }])
+    // Scoped to this entry, so a period pointing elsewhere is untouched.
+    for (const f of fpFilters) {
+      expect(f).toMatchObject({ company_id: 'company-1', opening_balance_entry_id: 'entry-1' })
+    }
+  })
+
+  it('leaves fiscal_periods untouched for a non-opening_balance entry', async () => {
+    const { supabase, fpUpdates } = buildSupabase('manual')
+
+    await reverseEntry(supabase as never, 'company-1', 'user-1', 'entry-1')
+
+    expect(fpUpdates).toEqual([])
   })
 })

@@ -25,8 +25,10 @@ vi.mock('../personnummer', () => ({
     return '199001011234' // Default: born 1990
   },
   calculateAgeAtYearStart: (pnr: string, year: number) => {
+    // Mirrors the real implementation: birth-year based (age attained by
+    // Dec 31 of the prior year), matching Skatteverket's cohort ranges.
     const birthYear = parseInt(pnr.slice(0, 4))
-    return year - birthYear
+    return year - 1 - birthYear
   },
 }))
 
@@ -317,7 +319,7 @@ describe('calculateSalary', () => {
   it('does not double-count base salary line items in vacation basis', () => {
     // The API auto-creates a monthly_salary line item with amount = baseSalary
     // and is_vacation_basis: true. The engine must not add it on top of its
-    // own baseSalary computation — otherwise procentregeln/semesterersättning
+    // own baseSalary computation: otherwise procentregeln/semesterersättning
     // would compute 2× the correct amount.
     const monthlyResult = calculateSalary(
       makeBasicInput({
@@ -559,7 +561,7 @@ describe('prorateBaseSalaryForPeriod', () => {
 })
 
 // ============================================================
-// Hardening — realistic API flow & cross-rule invariants
+// Hardening: realistic API flow & cross-rule invariants
 // ============================================================
 //
 // These tests mirror the actual production input shape, where the
@@ -601,7 +603,7 @@ function lineItem(overrides: Partial<LineItem> & { itemType: string; amount: num
   }
 }
 
-describe('hardening — vacation rule contract', () => {
+describe('hardening: vacation rule contract', () => {
   // Same input across all 4 vacation rules, locking in the relationships
   // between them. This is the contract a Swedish accountant relies on.
   const base = {
@@ -669,7 +671,7 @@ describe('hardening — vacation rule contract', () => {
   })
 })
 
-describe('hardening — boundaries', () => {
+describe('hardening: boundaries', () => {
   it('vacation_days_per_year = 29 uses 12%', () => {
     const r = calculateSalary(
       makeBasicInput({ vacationRule: 'procentregeln', vacationDaysPerYear: 29 }),
@@ -709,7 +711,7 @@ describe('hardening — boundaries', () => {
       }),
       config2026, emptyTaxRates
     )
-    expect(r.taxWithheld).toBe(4000) // 10% × 40000 — still valid on the last day
+    expect(r.taxWithheld).toBe(4000) // 10% × 40000: still valid on the last day
   })
 
   it('jämkning not applied the day after validTo', () => {
@@ -726,7 +728,7 @@ describe('hardening — boundaries', () => {
   })
 })
 
-describe('hardening — sammalöneregeln', () => {
+describe('hardening: sammalöneregeln', () => {
   it('part-time worker gets half the tillägg of a full-timer', () => {
     const full = calculateSalary(
       makeBasicInput({
@@ -758,7 +760,7 @@ describe('hardening — sammalöneregeln', () => {
   })
 })
 
-describe('hardening — realistic combined scenarios', () => {
+describe('hardening: realistic combined scenarios', () => {
   it('monthly worker with overtime, benefit, pension deduction, semesterersättning', () => {
     const r = calculateSalary(
       makeBasicInput({
@@ -822,7 +824,7 @@ describe('hardening — realistic combined scenarios', () => {
   })
 })
 
-describe('hardening — invariants', () => {
+describe('hardening: invariants', () => {
   it('netSalary + taxWithheld + netDeductions = grossSalary (always)', () => {
     for (const rule of ['procentregeln', 'sammaloneregeln', 'none', 'semesterersattning'] as const) {
       const r = calculateSalary(
@@ -872,7 +874,7 @@ describe('hardening — invariants', () => {
   })
 })
 
-describe('hardening — tax table lookup (not just flat fallback)', () => {
+describe('hardening: tax table lookup (not just flat fallback)', () => {
   const taxRates: TaxTableRate[] = [
     { tableYear: 2026, tableNumber: 32, columnNumber: 1, incomeFrom: 0, incomeTo: 20000, taxAmount: 3000 },
     { tableYear: 2026, tableNumber: 32, columnNumber: 1, incomeFrom: 20001, incomeTo: 30000, taxAmount: 5500 },
@@ -926,7 +928,7 @@ describe('calculateVacationAccrual (standalone export)', () => {
   })
 
   it('sammaloneregeln: uses vacationBasis, not monthlySalary (degree-adjusted)', () => {
-    // 50% worker — caller passes vacationBasis = 20000 (degree-adjusted),
+    // 50% worker: caller passes vacationBasis = 20000 (degree-adjusted),
     // not the raw 40000 monthlySalary. Result must be half the full-time amount.
     const partTime = calculateVacationAccrual({
       monthlySalary: 40000, // ignored
@@ -1029,6 +1031,19 @@ describe('calculateAvgifterRate', () => {
     expect(result.category).toBe('reduced_65plus')
   })
 
+  it('keeps the standard rate for born 1959 (turns 67 during 2026)', () => {
+    // "Fyllt 67 vid årets ingång" 2026 = born 1958 or earlier; born 1959
+    // gets the reduced rate from 2027. Jan-1 birthday, the exact edge.
+    const result = calculateAvgifterRate(
+      makeBasicInput({ personnummer: 'mock_born_1959' }),
+      config2026,
+      2026
+    )
+
+    expect(result.rate).toBe(0.3142)
+    expect(result.category).toBe('standard')
+  })
+
   it('returns 0% for born ≤1937', () => {
     const result = calculateAvgifterRate(
       makeBasicInput({ personnummer: 'mock_old_person' }),
@@ -1056,12 +1071,14 @@ describe('calculateAvgifterRate', () => {
   })
 
   // Ungdomsrabatt 2026-2027 (Prop. 2025/26:66). Eligibility test is
-  // age >= 18 AND age < 23 at årets ingång. Cases below pin all four age
-  // boundaries plus the period-window edges.
+  // age >= 18 AND age < 23 at årets ingång, applied by Skatteverket as
+  // birth-year cohorts (2026: born 2003-2007). Cases below pin all four
+  // cohort boundaries plus the period-window edges. Fixture birthdays are
+  // Jan 1, the exact edge the old birthday-inclusive age math misread.
   describe('youth rate (ungdomsrabatt 2026-2027)', () => {
-    it('NOT eligible — age 17 at year start (too young)', () => {
+    it('NOT eligible: born 2008 (17 vid årets ingång 2026, too young)', () => {
       const result = calculateAvgifterRate(
-        makeBasicInput({ personnummer: 'mock_born_2009', paymentDate: '2026-05-25' }),
+        makeBasicInput({ personnummer: 'mock_born_2008', paymentDate: '2026-05-25' }),
         config2026,
         2026,
       )
@@ -1069,9 +1086,9 @@ describe('calculateAvgifterRate', () => {
       expect(result.rate).toBe(0.3142)
     })
 
-    it('eligible — age 18 at year start (lower boundary)', () => {
+    it('eligible: born 2007 (18 vid årets ingång, lower boundary)', () => {
       const result = calculateAvgifterRate(
-        makeBasicInput({ personnummer: 'mock_born_2008', paymentDate: '2026-05-25' }),
+        makeBasicInput({ personnummer: 'mock_born_2007', paymentDate: '2026-05-25' }),
         config2026,
         2026,
       )
@@ -1079,9 +1096,9 @@ describe('calculateAvgifterRate', () => {
       expect(result.rate).toBe(0.2081)
     })
 
-    it('eligible — age 22 at year start (upper boundary)', () => {
+    it('eligible: born 2003 (22 vid årets ingång, upper boundary)', () => {
       const result = calculateAvgifterRate(
-        makeBasicInput({ personnummer: 'mock_born_2004', paymentDate: '2026-05-25' }),
+        makeBasicInput({ personnummer: 'mock_born_2003', paymentDate: '2026-05-25' }),
         config2026,
         2026,
       )
@@ -1091,9 +1108,9 @@ describe('calculateAvgifterRate', () => {
 
     // Regression: this is the case Skatteverket's AGI validator rejected.
     // The previous implementation incorrectly accepted age 23 at year start.
-    it('NOT eligible — age 23 at year start (just over)', () => {
+    it('NOT eligible: born 2002 (23 vid årets ingång, just over)', () => {
       const result = calculateAvgifterRate(
-        makeBasicInput({ personnummer: 'mock_born_2003', paymentDate: '2026-05-25' }),
+        makeBasicInput({ personnummer: 'mock_born_2002', paymentDate: '2026-05-25' }),
         config2026,
         2026,
       )
@@ -1101,7 +1118,7 @@ describe('calculateAvgifterRate', () => {
       expect(result.rate).toBe(0.3142)
     })
 
-    it('NOT eligible — age 22 but paid March 2026 (before period starts)', () => {
+    it('NOT eligible: in cohort but paid March 2026 (before period starts)', () => {
       const result = calculateAvgifterRate(
         makeBasicInput({ personnummer: 'mock_born_2004', paymentDate: '2026-03-15' }),
         config2026,
@@ -1111,7 +1128,7 @@ describe('calculateAvgifterRate', () => {
       expect(result.rate).toBe(0.3142)
     })
 
-    it('NOT eligible — age 22 but paid October 2027 (after period ends)', () => {
+    it('NOT eligible: in cohort but paid October 2027 (after period ends)', () => {
       const config2027: PayrollConfig = { ...config2026, configYear: 2027 }
       const result = calculateAvgifterRate(
         makeBasicInput({ personnummer: 'mock_born_2005', paymentDate: '2027-10-10' }),
@@ -1122,7 +1139,7 @@ describe('calculateAvgifterRate', () => {
       expect(result.rate).toBe(0.3142)
     })
 
-    it('eligible — payment exactly April 1 2026 (period start edge)', () => {
+    it('eligible: payment exactly April 1 2026 (period start edge)', () => {
       const result = calculateAvgifterRate(
         makeBasicInput({ personnummer: 'mock_born_2004', paymentDate: '2026-04-01' }),
         config2026,
@@ -1132,7 +1149,7 @@ describe('calculateAvgifterRate', () => {
       expect(result.rate).toBe(0.2081)
     })
 
-    it('eligible — payment exactly September 30 2027 (period end edge)', () => {
+    it('eligible: payment exactly September 30 2027 (period end edge)', () => {
       const config2027: PayrollConfig = { ...config2026, configYear: 2027 }
       const result = calculateAvgifterRate(
         makeBasicInput({ personnummer: 'mock_born_2005', paymentDate: '2027-09-30' }),
@@ -1145,14 +1162,14 @@ describe('calculateAvgifterRate', () => {
   })
 })
 
-describe('calculateSalary — youth cap', () => {
+describe('calculateSalary: youth cap', () => {
   // The 25 000 SEK monthly cap is applied by calculateSalary (not
   // calculateAvgifterRate) so it has to be exercised through the integration
   // path. Salary above the cap: discounted portion at 20.81%, excess at 31.42%.
   it('applies 20.81% on first 25 000 SEK and 31.42% on the excess', () => {
     const result = calculateSalary(
       makeBasicInput({
-        personnummer: 'mock_born_2004', // age 22 at year start 2026
+        personnummer: 'mock_born_2004', // age 21 at year start 2026
         paymentDate: '2026-06-25',
         monthlySalary: 30000,
       }),
@@ -1180,7 +1197,7 @@ describe('calculateSalary — youth cap', () => {
   })
 })
 
-describe('calculateSalary — shift premiums (OB-tillägg och övertid)', () => {
+describe('calculateSalary: shift premiums (OB-tillägg och övertid)', () => {
   it('treats ob_weekend as an addition to gross salary', () => {
     const result = calculateSalary(
       makeBasicInput({

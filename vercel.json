@@ -1,16 +1,25 @@
 {
+  "regions": ["arn1"],
   "crons": [
     {
       "path": "/api/deadlines/status/cron",
       "schedule": "0 6 * * *"
     },
-{
+    {
+      "path": "/api/invoices/recurring/cron",
+      "schedule": "0 * * * *"
+    },
+    {
       "path": "/api/tax-deadlines/cron",
-      "schedule": "0 0 2 1 *"
+      "schedule": "0 0 * * *"
     },
     {
       "path": "/api/extensions/enable-banking/sync/cron",
       "schedule": "0 5 * * *"
+    },
+    {
+      "path": "/api/extensions/stripe/sync/cron",
+      "schedule": "*/15 * * * *"
     },
     {
       "path": "/api/documents/verify/cron",
@@ -42,7 +51,11 @@
     },
     {
       "path": "/api/extensions/skatteverket/agi/kvittenser/cron",
-      "schedule": "0 */2 * * *"
+      "schedule": "*/15 * * * *"
+    },
+    {
+      "path": "/api/extensions/skatteverket/vat/kvittenser/cron",
+      "schedule": "30 */2 * * *"
     },
     {
       "path": "/api/webhooks/dispatch/cron",

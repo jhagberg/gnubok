@@ -33,22 +33,28 @@ interface AccountComboboxProps {
   // Label shown next to catalogue-only (not-yet-activated) accounts. Defaults
   // to Swedish; bilingual hosts pass a localized string.
   notActivatedLabel?: string
-  // Extra classes merged into the trigger Input — callers pass `h-8` for dense
+  // Extra classes merged into the trigger Input: callers pass `h-8` for dense
   // table rows, omit it to use the default Input height.
   className?: string
   // Optional callback ref to the underlying <input>, invoked alongside the
   // internal one. Lets a parent imperatively focus the field (e.g. auto-advance
-  // to the next konteringsrad's account on Enter — see JournalEntryForm.focusAccount).
+  // to the next konteringsrad's account on Enter: see JournalEntryForm.focusAccount).
   inputRef?: React.RefCallback<HTMLInputElement>
+  disabled?: boolean
 }
 
-export default function AccountCombobox({ value, accounts, onChange, onCommit, onCreateAccount, catalog, notActivatedLabel = 'Aktiveras vid bokföring', className, inputRef }: AccountComboboxProps) {
+export default function AccountCombobox({ value, accounts, onChange, onCommit, onCreateAccount, catalog, notActivatedLabel = 'Aktiveras vid bokföring', className, inputRef, disabled = false }: AccountComboboxProps) {
   const [search, setSearch] = useState(value)
   const [isOpen, setIsOpen] = useState(false)
   const [highlightedIndex, setHighlightedIndex] = useState(0)
   const containerRef = useRef<HTMLDivElement>(null)
   const internalInputRef = useRef<HTMLInputElement>(null)
   const listRef = useRef<HTMLDivElement>(null)
+  // Whether the user has typed or arrow-navigated since the field was focused.
+  // Enter only selects the highlighted item after an actual interaction: a
+  // bare Enter on a freshly-focused field must not grab the first account in
+  // the list (it either re-commits the current value or bubbles to the form).
+  const hasInteractedRef = useRef(false)
 
   // Attach the internal ref (used for focus bookkeeping) and forward the element
   // to any external callback ref the parent passed.
@@ -140,8 +146,14 @@ export default function AccountCombobox({ value, accounts, onChange, onCommit, o
   const handleKeyDown = (e: React.KeyboardEvent) => {
     if (!isOpen) {
       if (e.key === 'ArrowDown' || e.key === 'ArrowUp') {
+        hasInteractedRef.current = true
         setIsOpen(true)
         e.preventDefault()
+      } else if (e.key === 'Enter' && /^\d{4}$/.test(search)) {
+        // Dropdown closed but a full account number sits in the field: treat
+        // Enter as a re-commit so focus advances to the amount field.
+        e.preventDefault()
+        onCommit?.(search)
       }
       return
     }
@@ -149,16 +161,27 @@ export default function AccountCombobox({ value, accounts, onChange, onCommit, o
     switch (e.key) {
       case 'ArrowDown':
         e.preventDefault()
+        hasInteractedRef.current = true
         setHighlightedIndex((prev) => Math.min(prev + 1, flatList.length - 1))
         break
       case 'ArrowUp':
         e.preventDefault()
+        hasInteractedRef.current = true
         setHighlightedIndex((prev) => Math.max(prev - 1, 0))
         break
       case 'Enter':
-        e.preventDefault()
-        if (flatList[highlightedIndex]) {
+        if (hasInteractedRef.current && flatList[highlightedIndex]) {
+          e.preventDefault()
           selectAccount(flatList[highlightedIndex].account_number)
+        } else if (/^\d{4}$/.test(search)) {
+          // Committed number, no new interaction: advance without re-selecting.
+          e.preventDefault()
+          setIsOpen(false)
+          onCommit?.(search)
+        } else {
+          // Nothing actively chosen: close the list and let the event bubble
+          // so the form-level Enter (open review when balanced) can take over.
+          setIsOpen(false)
         }
         break
       case 'Escape':
@@ -170,16 +193,17 @@ export default function AccountCombobox({ value, accounts, onChange, onCommit, o
 
   const handleInputChange = (e: React.ChangeEvent<HTMLInputElement>) => {
     const newValue = e.target.value
+    hasInteractedRef.current = true
     setSearch(newValue)
     // Emit any 4-digit numeric value to the parent. Unknown BAS numbers are
-    // accepted optimistically — the submit-time ActivateAccountsDialog lets
+    // accepted optimistically: the submit-time ActivateAccountsDialog lets
     // the user activate missing accounts without leaving the form. A complete
     // 4-digit number is treated as a commit so focus can advance to the amount.
     if (/^\d{4}$/.test(newValue)) {
       onChange(newValue)
       // Only treat as a commit when the value newly becomes this account, so
       // editing an already-committed number doesn't keep stealing focus. On
-      // commit, close the dropdown too — focus advances to the amount field, so
+      // commit, close the dropdown too: focus advances to the amount field, so
       // a lingering open list would just cover the rows below.
       if (newValue !== value) {
         onCommit?.(newValue)
@@ -193,6 +217,7 @@ export default function AccountCombobox({ value, accounts, onChange, onCommit, o
   }
 
   const handleFocus = () => {
+    hasInteractedRef.current = false
     setIsOpen(true)
   }
 
@@ -201,7 +226,7 @@ export default function AccountCombobox({ value, accounts, onChange, onCommit, o
     // the rows below when focus advances via keyboard (Enter/Tab).
     setIsOpen(false)
     // Small delay to allow dropdown click to fire first. Keep any 4-digit
-    // numeric value even if it's not in the currently-active chart — the
+    // numeric value even if it's not in the currently-active chart: the
     // submit handler will prompt to activate it.
     setTimeout(() => {
       const isFourDigit = /^\d{4}$/.test(search)
@@ -223,11 +248,12 @@ export default function AccountCombobox({ value, accounts, onChange, onCommit, o
         placeholder="Sök konto…"
         className={`font-mono ${className ?? ''}`.trim()}
         autoComplete="off"
+        disabled={disabled}
       />
 
 
       {/* Dropdown */}
-      {isOpen && flatList.length > 0 && (
+      {isOpen && !disabled && flatList.length > 0 && (
         <div
           ref={listRef}
           className="absolute z-50 top-full left-0 mt-1 min-w-[24rem] w-[max(100%,34rem)] max-h-[300px] overflow-y-auto rounded-md border border-input bg-card shadow-md"
@@ -272,7 +298,7 @@ export default function AccountCombobox({ value, accounts, onChange, onCommit, o
       )}
 
       {/* Empty state */}
-      {isOpen && search.trim() && flatList.length === 0 && (
+      {isOpen && !disabled && search.trim() && flatList.length === 0 && (
         <div className="absolute z-50 top-full left-0 mt-1 min-w-[24rem] w-[max(100%,34rem)] rounded-md border border-input bg-card shadow-md p-3">
           <p className="text-sm text-muted-foreground">
             Hittade inget konto som matchar.

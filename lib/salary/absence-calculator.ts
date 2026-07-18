@@ -36,16 +36,19 @@ export function calculateSjuklon(
   monthlySalary: number,
   sickDays: number,
   config: PayrollConfig,
-  isAterinsjuknande: boolean = false
+  isAterinsjuknande: boolean = false,
+  // Arbetsschema-lite: legacy 21 (5-day week) unless the employee's schedule
+  // says otherwise (dailyDivisor(workdays_per_week) from work-schedule.ts).
+  dailyDivisor: number = 21
 ): SjuklonResult {
   const steps: AbsenceStep[] = []
   const r = (x: number) => Math.round(x * 100) / 100
 
-  // Daily rate = monthly / 21 working days
-  const dailyRate = r(monthlySalary / 21)
+  // Daily rate = monthly / workdays-per-month divisor
+  const dailyRate = r(monthlySalary / dailyDivisor)
   steps.push({
     label: 'Dagslön',
-    formula: 'monthly_salary / 21',
+    formula: `monthly_salary / ${dailyDivisor}`,
     input: { monthly_salary: monthlySalary },
     output: dailyRate,
   })
@@ -113,16 +116,17 @@ export function calculateSjuklon(
 
 /**
  * Calculate VAB (vård av barn) deduction.
- * Full daily rate deduction — Försäkringskassan compensates the parent.
+ * Full daily rate deduction: Försäkringskassan compensates the parent.
  * Semesterlönegrundande for first 120 days (180 for sole custody) per §17b.
  */
 export function calculateVabDeduction(
   monthlySalary: number,
   vabDays: number,
-  totalVabDaysThisYear: number = 0
+  totalVabDaysThisYear: number = 0,
+  dailyDivisor: number = 21
 ): { deduction: number; semesterGrundande: boolean; steps: AbsenceStep[] } {
   const r = (x: number) => Math.round(x * 100) / 100
-  const dailyRate = r(monthlySalary / 21)
+  const dailyRate = r(monthlySalary / dailyDivisor)
   const deduction = r(dailyRate * vabDays)
   const semesterGrundande = totalVabDaysThisYear + vabDays <= 120
 
@@ -145,10 +149,11 @@ export function calculateVabDeduction(
 export function calculateParentalLeaveDeduction(
   monthlySalary: number,
   parentalDays: number,
-  totalParentalDaysThisPregnancy: number = 0
+  totalParentalDaysThisPregnancy: number = 0,
+  dailyDivisor: number = 21
 ): { deduction: number; semesterGrundande: boolean; steps: AbsenceStep[] } {
   const r = (x: number) => Math.round(x * 100) / 100
-  const dailyRate = r(monthlySalary / 21)
+  const dailyRate = r(monthlySalary / dailyDivisor)
   const deduction = r(dailyRate * parentalDays)
   const semesterGrundande = totalParentalDaysThisPregnancy + parentalDays <= 120
 
@@ -181,13 +186,13 @@ export function calculateVacationPay(params: {
   const dailyRate = r(params.monthlySalary / 21)
 
   if (params.vacationRule === 'none') {
-    // No accrual — vacation is included in monthly pay. No tillägg paid.
+    // No accrual: vacation is included in monthly pay. No tillägg paid.
     return {
       amount: 0,
       tillagg: 0,
       steps: [{
         label: 'Semesterlön (avstängd)',
-        formula: 'ingen separat semesterlön — ingår i månadslönen',
+        formula: 'ingen separat semesterlön: ingår i månadslönen',
         input: { days: params.vacationDaysTaken },
         output: 0,
       }],

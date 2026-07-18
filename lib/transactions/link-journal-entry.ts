@@ -8,7 +8,7 @@
  *   - REST: app/api/transactions/[id]/link-journal-entry/route.ts
  *     (duplicate-payment UI: user confirms the suggested existing voucher)
  *   - MCP commit handler: lib/pending-operations/commit.ts
- *     (gnubok_link_transaction_to_journal_entry — agent-staged operation)
+ *     (gnubok_link_transaction_to_journal_entry, agent-staged operation)
  *
  * NEVER creates a new journal entry. The match log records
  * 'linked_to_existing_voucher' for audit on success.
@@ -25,7 +25,7 @@ const log = createLogger('transactions/link-journal-entry')
 // lib/errors/structured-errors.ts so both callers (REST route, MCP commit
 // handler) can surface the right HTTP status and the localized message.
 // The TX-not-found case reuses the shared TX_CATEGORIZE_TX_NOT_FOUND code
-// rather than a link-specific one — it predates this route and is the
+// rather than a link-specific one: it predates this route and is the
 // canonical "bank tx not found in this company" envelope.
 export type LinkTransactionJournalEntryErrorCode =
   | 'TX_CATEGORIZE_TX_NOT_FOUND'
@@ -34,6 +34,7 @@ export type LinkTransactionJournalEntryErrorCode =
   | 'LINK_TX_JE_NOT_POSTED'
   | 'LINK_TX_INVOICE_NOT_FOUND'
   | 'LINK_TX_INVOICE_NOT_OPEN'
+  | 'LINK_TX_INVOICE_CREDIT_NOTE'
   | 'LINK_TX_INVOICE_CURRENCY_MISMATCH'
   | 'LINK_TX_INVOICE_RACE'
   | 'MATCH_INVOICE_RECORD_PAYMENT_FAILED'
@@ -62,13 +63,13 @@ export type LinkTransactionJournalEntryOutcome =
 /**
  * Canonical verifikat-label format: `${series}-${number}` (e.g. "A-12").
  * Centralised so the MCP staging preview and the committed result can't
- * diverge — divergence is a BFL 5 kap 7§ traceability hazard because the
+ * diverge: divergence is a BFL 5 kap 7§ traceability hazard because the
  * verifikationsserie label that ends up in the audit trail must match the
  * label the user saw at approval time.
  *
  * Fallbacks ('A' series, empty number) are defensive only; in practice a
  * posted verifikat always has both. Callers should never construct this
- * string inline — import this helper instead.
+ * string inline: import this helper instead.
  */
 export function formatVoucherLabel(
   voucherSeries: string | null | undefined,
@@ -77,6 +78,43 @@ export function formatVoucherLabel(
   const series = voucherSeries ?? 'A'
   const num = voucherNumber ?? ''
   return num === '' ? series : `${series}-${num}`
+}
+
+/**
+ * Is `journalEntryId` a LIVE link, i.e. does it reference a posted verifikat?
+ *
+ * A transaction can carry a non-null `journal_entry_id` that no longer points
+ * at a live booking: reversing (storno) or correcting an entry marks the
+ * original `reversed`, and while both flows try to detach or re-point the
+ * transaction (engine.ts `reverseEntry`, storno-service `relinkTransactions-
+ * ToEntry`), those re-links are best-effort and rows reversed before #726
+ * (2026-06-15) were never touched at all. Such a transaction reads as "utan
+ * koppling" in the UI: the transactions page enriches only `status='posted'`
+ * links, so a reversed pointer renders as no link, yet the raw column is still
+ * set.
+ *
+ * The "already linked" guards on the re-booking paths must mirror that same
+ * posted-only predicate. If they treat any non-null pointer as linked, a
+ * transaction the UI shows as free can never be re-linked or re-categorized
+ * (issue #988). Returns true ONLY when the pointer references a posted entry;
+ * null / missing / reversed / cancelled / draft all count as no live link, so
+ * the caller may overwrite the stale pointer. Fails closed (returns true) on a
+ * read error so a transient lookup blip can never detach a genuinely live link.
+ */
+export async function hasLiveJournalEntryLink(
+  supabase: SupabaseClient,
+  companyId: string,
+  journalEntryId: string | null | undefined,
+): Promise<boolean> {
+  if (!journalEntryId) return false
+  const { data, error } = await supabase
+    .from('journal_entries')
+    .select('status')
+    .eq('id', journalEntryId)
+    .eq('company_id', companyId)
+    .maybeSingle()
+  if (error) return true
+  return data?.status === 'posted'
 }
 
 export async function linkTransactionToJournalEntry(
@@ -103,7 +141,15 @@ export async function linkTransactionToJournalEntry(
     return { ok: false, code: 'TX_CATEGORIZE_TX_NOT_FOUND' }
   }
 
-  if (transaction.journal_entry_id) {
+  // Only a LIVE (posted) pointer blocks re-linking. A pointer left behind by a
+  // storno/correction references a 'reversed' entry: the UI already shows the
+  // row as "utan koppling", so the guard must agree and let the user re-link it
+  // to another verifikat (issue #988). The stale pointer is overwritten by the
+  // optimistic-locked UPDATE below.
+  if (
+    transaction.journal_entry_id &&
+    (await hasLiveJournalEntryLink(supabase, companyId, transaction.journal_entry_id as string))
+  ) {
     return {
       ok: false,
       code: 'LINK_TX_TX_ALREADY_LINKED',
@@ -141,6 +187,7 @@ export async function linkTransactionToJournalEntry(
     | 'exchange_rate'
     | 'paid_at'
     | 'invoice_number'
+    | 'credited_invoice_id'
   > & { customer?: { name?: string } | null }
   let invoice: FetchedInvoice | null = null
   let newPaidAmount = 0
@@ -155,7 +202,7 @@ export async function linkTransactionToJournalEntry(
     const { data: invoiceRow, error: fetchInvError } = await supabase
       .from('invoices')
       .select(
-        'id, status, total, paid_amount, remaining_amount, currency, exchange_rate, paid_at, invoice_number, customer:customers(name)'
+        'id, status, total, paid_amount, remaining_amount, currency, exchange_rate, paid_at, invoice_number, credited_invoice_id, customer:customers(name)'
       )
       .eq('id', invoiceId)
       .eq('company_id', companyId)
@@ -163,6 +210,10 @@ export async function linkTransactionToJournalEntry(
 
     if (fetchInvError || !invoiceRow) {
       return { ok: false, code: 'LINK_TX_INVOICE_NOT_FOUND' }
+    }
+
+    if (invoiceRow.credited_invoice_id) {
+      return { ok: false, code: 'LINK_TX_INVOICE_CREDIT_NOTE' }
     }
 
     if (
@@ -208,17 +259,23 @@ export async function linkTransactionToJournalEntry(
   }
 
   // Snapshot tx state so the compensating-rollback path can restore the row
-  // if a subsequent step fails — otherwise a partial state would persist
+  // if a subsequent step fails: otherwise a partial state would persist
   // (tx linked, invoice unchanged, no payment row).
   const priorTxState = {
-    journal_entry_id: transaction.journal_entry_id, // validated null above
+    // null, or a stale 'reversed'-entry id we're clearing (validated not-live above)
+    journal_entry_id: transaction.journal_entry_id,
     invoice_id: transaction.invoice_id,
     potential_invoice_id: transaction.potential_invoice_id,
     potential_supplier_invoice_id: transaction.potential_supplier_invoice_id,
     is_business: transaction.is_business,
   }
 
-  const { error: updateTxError } = await supabase
+  // Optimistic lock on the pointer we validated: null for a free row, or the
+  // exact stale id for one we're detaching from a reversed entry. Locking on
+  // the known value (rather than always .is(null)) lets the stale-pointer
+  // overwrite through while still turning a concurrent re-link into a no-op.
+  const previousJournalEntryId = (transaction.journal_entry_id as string | null) ?? null
+  const txUpdate = supabase
     .from('transactions')
     .update({
       journal_entry_id: journalEntryId,
@@ -229,15 +286,30 @@ export async function linkTransactionToJournalEntry(
     })
     .eq('id', transactionId)
     .eq('company_id', companyId)
-    .is('journal_entry_id', null)
+  const { data: updatedTxRows, error: updateTxError } = await (previousJournalEntryId === null
+    ? txUpdate.is('journal_entry_id', null)
+    : txUpdate.eq('journal_entry_id', previousJournalEntryId)
+  ).select('id')
 
   if (updateTxError) {
     return { ok: false, code: 'LINK_TX_DB_ERROR', details: { reason: updateTxError.message } }
   }
+  // CAS lost: a concurrent linker changed the pointer between the liveness
+  // check and this write, so 0 rows matched. Fail BEFORE any invoice side
+  // effects: otherwise we'd settle the invoice + insert an invoice_payments row
+  // for a transaction we didn't actually link (same optimistic-lock contract as
+  // manualLink in lib/reconciliation/bank-reconciliation.ts).
+  if (!updatedTxRows || updatedTxRows.length === 0) {
+    return {
+      ok: false,
+      code: 'LINK_TX_TX_ALREADY_LINKED',
+      details: { existingJournalEntryId: previousJournalEntryId },
+    }
+  }
 
   async function rollbackTxLink(reason: string): Promise<void> {
     // SOC 2 PI1.3 (processing integrity): if a rollback itself fails, the
-    // ledger ends up in a partial state — tx pointing at the existing
+    // ledger ends up in a partial state: tx pointing at the existing
     // verifikat with no invoice_payments row, or the invoice row at an
     // intermediate paid_amount. We surface the rollback failure (IDs only,
     // no amounts or counterparty names) so a reconciliation job can
@@ -285,10 +357,10 @@ export async function linkTransactionToJournalEntry(
       return { ok: false, code: 'LINK_TX_INVOICE_RACE' }
     }
 
-    // BFL 5 kap 2§ + ML 8 kap 21–23§: the payment row must record the rate
+    // BFL 5 kap 2§ + ML 8 kap 21-23§: the payment row must record the rate
     // effective on the PAYMENT date, not the invoice-creation date. If
     // transaction.exchange_rate is null (SEK tx, no rate needed), leave the
-    // payment row's rate null too — a downstream Riksbanken lookup can
+    // payment row's rate null too: a downstream Riksbanken lookup can
     // populate it lazily if reporting needs it. Falling back to
     // invoice.exchange_rate would silently record the wrong (invoice-date)
     // rate, which corrupts the FX-diff figures in any later VAT or income

@@ -1,8 +1,7 @@
 'use client'
 
 import { useState, useEffect } from 'react'
-import Link from 'next/link'
-import { useRouter } from 'next/navigation'
+import { useRouter, useSearchParams } from 'next/navigation'
 import { useTranslations } from 'next-intl'
 import { Button } from '@/components/ui/button'
 import { Card, CardContent } from '@/components/ui/card'
@@ -17,10 +16,15 @@ import {
   TableRow,
 } from '@/components/ui/table'
 import { EmptyState } from '@/components/ui/empty-state'
+import {
+  DestructiveConfirmDialog,
+  useDestructiveConfirm,
+} from '@/components/ui/destructive-confirm-dialog'
 import { useToast } from '@/components/ui/use-toast'
 import { useCanWrite } from '@/lib/hooks/use-can-write'
 import { formatDate } from '@/lib/utils'
 import { Plus, Repeat, Lock, AlertTriangle } from 'lucide-react'
+import NewRecurringScheduleDialog from '@/components/invoices/NewRecurringScheduleDialog'
 import type { RecurringInvoiceSchedule, Customer } from '@/types'
 
 type ScheduleRow = RecurringInvoiceSchedule & {
@@ -30,10 +34,31 @@ type ScheduleRow = RecurringInvoiceSchedule & {
 export default function RecurringInvoicesPage() {
   const [schedules, setSchedules] = useState<ScheduleRow[]>([])
   const [isLoading, setIsLoading] = useState(true)
+  const [runningId, setRunningId] = useState<string | null>(null)
+  const [togglingId, setTogglingId] = useState<string | null>(null)
+  const [deletingId, setDeletingId] = useState<string | null>(null)
   const { canWrite } = useCanWrite()
   const { toast } = useToast()
+  const { dialogProps, confirm: confirmAction } = useDestructiveConfirm()
   const router = useRouter()
+  const searchParams = useSearchParams()
   const t = useTranslations('invoice_recurring')
+
+  // The "Nytt schema" modal is driven by the URL (?new=1) so every entry
+  // point (the header button, the empty state, and the legacy
+  // /invoices/recurring/new redirect) opens the same dialog, and the
+  // browser back button closes it. Same pattern as /invoices.
+  const showNewSchedule = searchParams.has('new')
+  const closeNewSchedule = () => router.replace('/invoices/recurring', { scroll: false })
+  const openNewSchedule = () => router.push('/invoices/recurring?new=1', { scroll: false })
+
+  // Editing reuses the same modal, driven by ?edit=<id>. The schedule is taken
+  // from the already-loaded list (it carries items + send_hour), so clicking a
+  // row opens a prefilled form with no extra fetch.
+  const editId = searchParams.get('edit')
+  const editSchedule = editId ? schedules.find((s) => s.id === editId) : undefined
+  const closeEdit = () => router.replace('/invoices/recurring', { scroll: false })
+  const openEdit = (id: string) => router.push(`/invoices/recurring?edit=${id}`, { scroll: false })
 
   async function fetchSchedules() {
     setIsLoading(true)
@@ -57,35 +82,97 @@ export default function RecurringInvoicesPage() {
   }, [])
 
   async function togglePause(s: ScheduleRow) {
+    // In-flight guard: the confirm dialog closes before the PATCH settles,
+    // so a second click would fire a duplicate request.
+    if (togglingId) return
     const next = s.status === 'active' ? 'paused' : 'active'
-    const res = await fetch(`/api/invoices/recurring/${s.id}`, {
-      method: 'PATCH',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ status: next }),
+    // Reactivating an auto-send schedule resumes automatic emails to the
+    // customer, so make the user consciously confirm they mean to turn it on.
+    if (next === 'active' && s.auto_send) {
+      const ok = await confirmAction({
+        title: t('resume_autosend_confirm_title'),
+        description: t('resume_autosend_confirm', { name: s.name }),
+        confirmLabel: t('resume'),
+        variant: 'warning',
+      })
+      if (!ok) return
+    }
+    setTogglingId(s.id)
+    try {
+      const res = await fetch(`/api/invoices/recurring/${s.id}`, {
+        method: 'PATCH',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ status: next }),
+      })
+      if (res.ok) {
+        toast({
+          title: next === 'paused' ? t('schedule_paused_title') : t('schedule_resumed_title'),
+        })
+        fetchSchedules()
+      } else {
+        toast({
+          title: t('schedule_update_failed_title'),
+          variant: 'destructive',
+        })
+      }
+    } finally {
+      setTogglingId(null)
+    }
+  }
+
+  async function runNow(s: ScheduleRow) {
+    // In-flight guard: a second click while the request runs would create a
+    // duplicate invoice for the customer.
+    if (runningId) return
+    const ok = await confirmAction({
+      title: t('run_now_confirm_title'),
+      description: t('run_now_confirm', { name: s.name }),
+      confirmLabel: t('run_now'),
+      variant: 'warning',
     })
-    if (res.ok) {
-      toast({
-        title: next === 'paused' ? t('schedule_paused_title') : t('schedule_resumed_title'),
-      })
-      fetchSchedules()
-    } else {
-      toast({
-        title: t('schedule_update_failed_title'),
-        variant: 'destructive',
-      })
+    if (!ok) return
+    setRunningId(s.id)
+    try {
+      const res = await fetch(`/api/invoices/recurring/${s.id}/run`, { method: 'POST' })
+      if (res.ok) {
+        const json = await res.json().catch(() => ({}))
+        const warning = (json?.data?.warning as string | null | undefined) ?? undefined
+        toast({
+          title: t('run_now_success_title'),
+          description: warning,
+          variant: warning ? 'destructive' : undefined,
+        })
+        fetchSchedules()
+      } else {
+        toast({ title: t('run_now_failed_title'), variant: 'destructive' })
+      }
+    } finally {
+      setRunningId(null)
     }
   }
 
   async function deleteSchedule(s: ScheduleRow) {
-    if (!confirm(t('delete_confirm', { name: s.name }))) {
-      return
-    }
-    const res = await fetch(`/api/invoices/recurring/${s.id}`, { method: 'DELETE' })
-    if (res.ok) {
-      toast({ title: t('schedule_deleted_title') })
-      fetchSchedules()
-    } else {
-      toast({ title: t('schedule_delete_failed_title'), variant: 'destructive' })
+    // In-flight guard: the confirm dialog closes before the DELETE settles,
+    // so a second click would fire a duplicate request.
+    if (deletingId) return
+    const ok = await confirmAction({
+      title: t('delete_confirm_title'),
+      description: t('delete_confirm', { name: s.name }),
+      confirmLabel: t('delete'),
+      variant: 'destructive',
+    })
+    if (!ok) return
+    setDeletingId(s.id)
+    try {
+      const res = await fetch(`/api/invoices/recurring/${s.id}`, { method: 'DELETE' })
+      if (res.ok) {
+        toast({ title: t('schedule_deleted_title') })
+        fetchSchedules()
+      } else {
+        toast({ title: t('schedule_delete_failed_title'), variant: 'destructive' })
+      }
+    } finally {
+      setDeletingId(null)
     }
   }
 
@@ -95,12 +182,10 @@ export default function RecurringInvoicesPage() {
         title={t('title')}
         action={
           canWrite ? (
-            <Link href="/invoices/recurring/new">
-              <Button>
-                <Plus className="mr-2 h-4 w-4" />
-                {t('new_schedule')}
-              </Button>
-            </Link>
+            <Button onClick={openNewSchedule}>
+              <Plus className="mr-2 h-4 w-4" />
+              {t('new_schedule')}
+            </Button>
           ) : (
             <Button disabled title={t('viewer_disabled_tooltip')}>
               <Lock className="mr-2 h-4 w-4" />
@@ -124,7 +209,7 @@ export default function RecurringInvoicesPage() {
               title={t('empty_title')}
               description={t('empty_description')}
               actionLabel={canWrite ? t('new_schedule') : undefined}
-              actionHref={canWrite ? '/invoices/recurring/new' : undefined}
+              onAction={canWrite ? openNewSchedule : undefined}
             />
           </CardContent>
         </Card>
@@ -147,8 +232,8 @@ export default function RecurringInvoicesPage() {
                 {schedules.map((s) => (
                   <TableRow
                     key={s.id}
-                    className="cursor-pointer"
-                    onClick={() => router.push(`/invoices/recurring/${s.id}`)}
+                    className={canWrite ? 'cursor-pointer' : undefined}
+                    onClick={canWrite ? () => openEdit(s.id) : undefined}
                   >
                     <TableCell className="font-medium">
                       <div className="flex items-center gap-2">
@@ -162,9 +247,17 @@ export default function RecurringInvoicesPage() {
                       </div>
                     </TableCell>
                     <TableCell className="text-muted-foreground">
-                      {s.customer?.name ?? '—'}
+                      {s.customer?.name ?? '-'}
                     </TableCell>
-                    <TableCell className="tabular-nums">{s.day_of_month}</TableCell>
+                    <TableCell className="tabular-nums">
+                      {s.day_of_month}
+                      <span className="text-muted-foreground">
+                        {' · '}
+                        {t('send_time', {
+                          time: `${String(s.send_hour ?? 8).padStart(2, '0')}:00`,
+                        })}
+                      </span>
+                    </TableCell>
                     <TableCell className="tabular-nums">{formatDate(s.next_run_date)}</TableCell>
                     <TableCell>
                       {s.status === 'active' ? (
@@ -186,6 +279,15 @@ export default function RecurringInvoicesPage() {
                             <Button
                               variant="secondary"
                               size="sm"
+                              disabled={runningId !== null}
+                              onClick={() => runNow(s)}
+                            >
+                              {t('run_now')}
+                            </Button>
+                            <Button
+                              variant="secondary"
+                              size="sm"
+                              disabled={togglingId !== null}
                               onClick={() => togglePause(s)}
                             >
                               {s.status === 'active' ? t('pause') : t('resume')}
@@ -193,6 +295,7 @@ export default function RecurringInvoicesPage() {
                             <Button
                               variant="ghost"
                               size="sm"
+                              disabled={deletingId !== null}
                               onClick={() => deleteSchedule(s)}
                             >
                               {t('delete')}
@@ -208,6 +311,31 @@ export default function RecurringInvoicesPage() {
           </CardContent>
         </Card>
       )}
+
+      <NewRecurringScheduleDialog
+        open={showNewSchedule}
+        onOpenChange={(open) => {
+          if (!open) closeNewSchedule()
+        }}
+        onSaved={() => {
+          closeNewSchedule()
+          fetchSchedules()
+        }}
+      />
+
+      <NewRecurringScheduleDialog
+        open={!!editSchedule}
+        schedule={editSchedule}
+        onOpenChange={(open) => {
+          if (!open) closeEdit()
+        }}
+        onSaved={() => {
+          closeEdit()
+          fetchSchedules()
+        }}
+      />
+
+      <DestructiveConfirmDialog {...dialogProps} />
     </div>
   )
 }

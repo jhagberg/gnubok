@@ -8,6 +8,15 @@ vi.mock('@/lib/supabase/server', () => ({
   createClient: vi.fn(),
 }))
 
+const deadlineMocks = vi.hoisted(() => ({
+  regenerate: vi.fn().mockResolvedValue({ created: 1, deleted: 0 }),
+}))
+
+vi.mock('@/lib/tax/deadline-generator', () => ({
+  regenerateTaxDeadlinesForUser: deadlineMocks.regenerate,
+  toDeadlineSettings: vi.fn((settings: Record<string, unknown>) => settings),
+}))
+
 // Keep the real CompanyContextError so instanceof checks in switchCompany
 // see the same class the tests throw.
 vi.mock('@/lib/company/context', async (importOriginal) => ({
@@ -83,6 +92,7 @@ function buildSupabase(opts: {
 
 beforeEach(() => {
   vi.clearAllMocks()
+  deadlineMocks.regenerate.mockResolvedValue({ created: 1, deleted: 0 })
 })
 
 describe('switchCompany', () => {
@@ -141,7 +151,7 @@ describe('switchCompany', () => {
   })
 })
 
-describe('createCompanyFromOnboarding — org_number validation', () => {
+describe('createCompanyFromOnboarding: org_number validation', () => {
   it('rejects malformed org_numbers at the guard boundary', async () => {
     const { supabase } = buildSupabase({
       user: { id: 'user-1' },
@@ -164,7 +174,7 @@ describe('createCompanyFromOnboarding — org_number validation', () => {
     })
 
     expect(result.error).toBe('org_number_invalid')
-    // Must NOT have reached the create RPC — otherwise we'd save a malformed
+    // Must NOT have reached the create RPC: otherwise we'd save a malformed
     // org_number and poison SIE/SRU exports.
     const rpcCreate = supabase.rpc.mock.calls.find(([name]) => name === 'create_company_with_owner')
     expect(rpcCreate).toBeUndefined()
@@ -201,7 +211,7 @@ describe('createCompanyFromOnboarding — org_number validation', () => {
   })
 })
 
-describe('createCompanyFromOnboarding — TIC snapshot persistence', () => {
+describe('createCompanyFromOnboarding: TIC snapshot persistence', () => {
   it('persists the supplied ticLookup to companies.tic_snapshot', async () => {
     const { supabase, calls } = buildSupabase({
       user: { id: 'user-1' },
@@ -256,6 +266,40 @@ describe('createCompanyFromOnboarding — TIC snapshot persistence', () => {
     const payload = snapshotUpdate!.args[0] as Record<string, unknown>
     expect(payload.tic_snapshot).toEqual(ticLookup)
     expect(payload.tic_snapshot_fetched_at).toBeDefined()
+    expect(deadlineMocks.regenerate).toHaveBeenCalledWith(
+      supabase,
+      'new-company-id',
+      expect.objectContaining({ entity_type: 'aktiebolag' }),
+    )
+  })
+
+  it('rolls back company creation when automatic deadlines cannot be created', async () => {
+    const { supabase, calls } = buildSupabase({
+      user: { id: 'user-1' },
+      rpcResults: {
+        create_company_with_owner: { data: 'new-company-id' },
+        seed_chart_of_accounts: { data: null },
+      },
+    })
+    mockCreateClient.mockResolvedValue(supabase as never)
+    deadlineMocks.regenerate.mockRejectedValueOnce(new Error('deadline insert failed'))
+
+    const result = await createCompanyFromOnboarding({
+      teamId: 'team-1',
+      settings: {
+        entity_type: 'aktiebolag',
+        company_name: 'Acme AB',
+      },
+      fiscalPeriod: {
+        startDate: '2026-01-01',
+        endDate: '2026-12-31',
+        name: 'Räkenskapsår 2026',
+      },
+    })
+
+    expect(result).toEqual({ error: 'Kunde inte skapa skattedeadlines. Försök igen.' })
+    expect(calls).toContainEqual(expect.objectContaining({ table: 'companies', method: 'delete' }))
+    expect(mockSetActiveCompany).not.toHaveBeenCalled()
   })
 
   it('skips the snapshot update when no ticLookup is supplied (manual signup)', async () => {
@@ -273,7 +317,7 @@ describe('createCompanyFromOnboarding — TIC snapshot persistence', () => {
       settings: {
         entity_type: 'aktiebolag',
         company_name: 'Manual AB',
-        // No org_number — exercises the path where the org_number UPDATE also
+        // No org_number: exercises the path where the org_number UPDATE also
         // doesn't run, so we can isolate the no-snapshot guarantee.
       },
       fiscalPeriod: {

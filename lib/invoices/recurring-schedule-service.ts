@@ -19,8 +19,16 @@ import { ensureInvoiceNumber } from '@/lib/invoices/ensure-invoice-number'
 import { createInvoiceJournalEntry } from '@/lib/bookkeeping/invoice-entries'
 import { renderToBuffer } from '@react-pdf/renderer'
 import { InvoicePDF } from '@/lib/invoices/pdf-template'
-import { prepareInvoicePdfRender, buildSwishQrDataUrl } from '@/lib/invoices/pdf-render-helpers'
+import {
+  prepareInvoicePdfRender,
+  buildSwishQrDataUrl,
+  buildPaymentLinkQrDataUrl,
+} from '@/lib/invoices/pdf-render-helpers'
+import { applyPaymentLinkToInvoice } from '@/lib/extensions/payment-links'
 import { getEmailService } from '@/lib/email/service'
+import { hasCapability } from '@/lib/entitlements/has-capability'
+import { CAPABILITY } from '@/lib/entitlements/keys'
+import { isSandboxCompany } from '@/lib/sandbox/guard'
 import {
   generateInvoiceEmailHtml,
   generateInvoiceEmailText,
@@ -65,7 +73,7 @@ function lastDayOfMonth(year: number, monthIndex0: number): number {
  *    NEXT month's occurrence (callers compute the FIRST run via
  *    computeInitialRunDate).
  *  - Day 29-31 in shorter months clamps to that month's last day.
- *  - The schedule's stored day_of_month is unchanged — caller passes it in.
+ *  - The schedule's stored day_of_month is unchanged: caller passes it in.
  */
 export function computeNextRunDate(reference: Date, dayOfMonth: number): string {
   if (dayOfMonth < 1 || dayOfMonth > 31) {
@@ -114,6 +122,40 @@ export function computeInitialRunDate(
 }
 
 /**
+ * Resolve the calendar date (yyyy-mm-dd) and hour (0-23) in Europe/Stockholm
+ * for a given instant. The recurring cron runs in UTC on Vercel, but users
+ * pick a send time in Swedish local time, so we need "what day and hour is it
+ * in Sweden right now". Uses Intl (DST-aware, no extra dependency); en-CA +
+ * hourCycle 'h23' guarantees zero-padded ISO-shaped parts and a 0-23 hour.
+ */
+export function getStockholmDateHour(instant: Date): { date: string; hour: number } {
+  const parts = new Intl.DateTimeFormat('en-CA', {
+    timeZone: 'Europe/Stockholm',
+    year: 'numeric',
+    month: '2-digit',
+    day: '2-digit',
+    hour: '2-digit',
+    hourCycle: 'h23',
+  }).formatToParts(instant)
+  const get = (type: string) => parts.find((p) => p.type === type)?.value ?? ''
+  return {
+    date: `${get('year')}-${get('month')}-${get('day')}`,
+    hour: Number(get('hour')),
+  }
+}
+
+export interface ExecuteScheduleOptions {
+  /**
+   * Defence-in-depth sandbox suppression (ASVS V2.3): callers that resolved
+   * `isSandboxCompany` at the route level pass true to skip the auto-send
+   * path outright, so the sandbox invariant does not hinge solely on the
+   * chokepoint inside sendInvoiceFromSchedule. Freeze-and-retain semantics
+   * are unchanged: the invoice is still created as a numbered draft.
+   */
+  suppressAutoSend?: boolean
+}
+
+/**
  * Spawn one invoice from a schedule. Always creates the invoice; auto_send
  * additionally renders + emails + flips status + creates JE + archives PDF.
  *
@@ -124,6 +166,7 @@ export async function executeRecurringSchedule(
   supabase: SupabaseClient,
   schedule: RecurringInvoiceSchedule & { items: RecurringInvoiceScheduleItem[] },
   today: Date = new Date(),
+  options: ExecuteScheduleOptions = {},
 ): Promise<ExecuteResult> {
   const opLog = log.child({ scheduleId: schedule.id, companyId: schedule.company_id })
 
@@ -253,8 +296,8 @@ export async function executeRecurringSchedule(
   })
   const { error: itemsError } = await supabase.from('invoice_items').insert(itemRows)
   if (itemsError) {
-    // Hard-delete is safe here only because step 5 inserted invoice_number: null
-    // — no F-series slot has been consumed yet (step 7 calls ensureInvoiceNumber).
+    // Hard-delete is safe here only because step 5 inserted invoice_number: null,
+    // no F-series slot has been consumed yet (step 7 calls ensureInvoiceNumber).
     // Once a number is assigned, the soft-cancel path in step 7 must be used to
     // preserve the sequence per BFL 5 kap 6§ / ML 17 kap 24§.
     await supabase.from('invoices').delete().eq('id', invoice.id)
@@ -302,9 +345,17 @@ export async function executeRecurringSchedule(
   let warning: string | null = null
 
   // 9. Auto-send path. If anything below fails, we keep the invoice (now a
-  //    numbered draft) and surface a Swedish warning on the schedule — the
+  //    numbered draft) and surface a Swedish warning on the schedule: the
   //    user can manually send from /invoices/[id].
-  if (schedule.auto_send) {
+  if (schedule.auto_send && options.suppressAutoSend) {
+    // Route-level sandbox suppression: same outcome as the internal sandbox
+    // chokepoint below (no email, invoice retained as draft, manual-send
+    // warning), reached without entering the send path at all.
+    opLog.warn('auto-send suppressed by route-level sandbox guard', {
+      invoiceId: invoice.id,
+    })
+    warning = 'Auto-utskick misslyckades: fakturan finns som utkast och kan skickas manuellt.'
+  } else if (schedule.auto_send) {
     try {
       autoSent = await sendInvoiceFromSchedule(
         supabase,
@@ -313,7 +364,7 @@ export async function executeRecurringSchedule(
         completeInvoice as Invoice & { customer: Customer; items: InvoiceItem[] },
       )
       if (!autoSent) {
-        warning = 'Auto-utskick misslyckades — fakturan finns som utkast och kan skickas manuellt.'
+        warning = 'Auto-utskick misslyckades: fakturan finns som utkast och kan skickas manuellt.'
       }
     } catch (err) {
       opLog.error('auto-send failed for recurring schedule', err as Error, {
@@ -361,6 +412,28 @@ async function sendInvoiceFromSchedule(
     })
     return false
   }
+  // The sandbox must never deliver a real email to a real address. The
+  // interactive send routes enforce this with guardSandbox, but cron and
+  // run-now reach this function without any route-level guard, so the
+  // invariant is enforced here at the email chokepoint. Freeze-and-retain
+  // like the paywall path below: the invoice is still generated as a draft.
+  if (await isSandboxCompany(supabase, companyId)) {
+    log.warn('sandbox company; recurring schedule cannot auto-send', {
+      invoiceId: invoice.id,
+      companyId,
+    })
+    return false
+  }
+  // Paywall: email sending is a paid capability. The invoice itself is still
+  // created (bookkeeping stays free); it just isn't emailed, and the schedule
+  // surfaces the standard manual-send warning (freeze-and-retain).
+  if (!(await hasCapability(supabase, companyId, CAPABILITY.email_send))) {
+    log.warn('company lacks email_send capability; recurring schedule cannot auto-send', {
+      invoiceId: invoice.id,
+      companyId,
+    })
+    return false
+  }
   if (!invoice.customer.email) {
     log.warn('customer has no email; recurring schedule cannot auto-send', {
       invoiceId: invoice.id,
@@ -376,16 +449,37 @@ async function sendInvoiceFromSchedule(
     .single<CompanySettings>()
 
   if (!company) {
-    throw new Error('company settings missing — cannot send invoice')
+    throw new Error('company settings missing: cannot send invoice')
   }
 
   const items = (invoice.items || []).slice().sort((a, b) => a.sort_order - b.sort_order)
+
+  // Auto-create an online payment link (extension-provided, e.g. Stripe) so
+  // the email button and PDF QR carry it: parity with the manual and v1 send
+  // routes. Best-effort: the faktura is legally valid without a link, so a
+  // failure only logs and the send proceeds. On success the helper mirrors
+  // payment_link_url onto this invoice object, which the email template and
+  // QR builder below read.
+  const { failure: paymentLinkFailure } = await applyPaymentLinkToInvoice(
+    supabase,
+    companyId,
+    userId,
+    invoice,
+    log,
+  )
+  if (paymentLinkFailure) {
+    log.warn('payment link creation failed for recurring invoice; sending without it', {
+      invoiceId: invoice.id,
+      reason: paymentLinkFailure,
+    })
+  }
 
   // Render PDF with status overridden to 'sent' so the customer doesn't
   // receive a "UTKAST" stamp.
   const renderableInvoice = { ...invoice, status: 'sent' as const }
   const { branding, company: renderCompany } = await prepareInvoicePdfRender(company)
   const swishQrDataUrl = await buildSwishQrDataUrl(company, renderableInvoice)
+  const paymentLinkQrDataUrl = await buildPaymentLinkQrDataUrl(renderableInvoice)
   const pdfBuffer = await renderToBuffer(
     InvoicePDF({
       invoice: renderableInvoice,
@@ -394,6 +488,7 @@ async function sendInvoiceFromSchedule(
       company: renderCompany,
       branding,
       swishQrDataUrl,
+      paymentLinkQrDataUrl,
     }),
   )
 
@@ -423,7 +518,7 @@ async function sendInvoiceFromSchedule(
     return false
   }
 
-  // Email delivered — flip status, create JE, archive PDF. Treat downstream
+  // Email delivered: flip status, create JE, archive PDF. Treat downstream
   // failures as warnings (don't unsend the email).
   await supabase
     .from('invoices')

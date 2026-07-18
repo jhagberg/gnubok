@@ -13,14 +13,14 @@
  * `errorResponseFromCode`; v1 uses `v1ErrorResponseFromCode`).
  *
  * Strict-mode: the function aborts at the FIRST per-employee failure. There
- * is no partial-state recovery — either every employee succeeds and the run
+ * is no partial-state recovery: either every employee succeeds and the run
  * gets its aggregated totals + updated row, or the caller receives an error
  * and the run remains in `draft`. This matches the dashboard's behaviour and
  * is required for BFL 5 kap: a half-calculated run that later advances to
  * `review` would post a wrong verifikation when `:book` runs.
  *
  * The function does NOT advance the salary_runs status. That's the route's
- * responsibility — the dashboard leaves the run in `draft` (an explicit
+ * responsibility: the dashboard leaves the run in `draft` (an explicit
  * `/review` verb does the freeze), while v1 collapses calculate+review into
  * a single verb. Routes layer the status transition on top of this result.
  */
@@ -32,6 +32,8 @@ import { fetchAllTaxTableRatesForRun, TaxTableUnavailableError } from './tax-tab
 import { loadAndDeriveAbsence } from './derive-absence-line-items'
 import { getLineItemAccount } from './account-mapping'
 import { computePremiumLines } from './shift-premium-engine'
+import { roundOre } from '@/lib/money'
+import { dailyDivisor, hourlyDivisor } from './work-schedule'
 import type { WorkedDayShift } from './shift-premium-engine'
 import type { Logger } from '@/lib/logger'
 import type { SalaryLineItemType, ShiftPremiumRule, ShiftPremiumItemType } from '@/types'
@@ -63,19 +65,20 @@ const DERIVED_PREMIUM_TYPES: ShiftPremiumItemType[] = [
 /**
  * Effective hourly rate used as the base for shift-premium computation.
  *   - Hourly employees: their stored hourly_rate.
- *   - Monthly employees: monthly_salary / 173 (common Swedish derivation for
- *     full-time monthly → hourly, matches the timlön conventions used in
- *     CBAs). Applied even to part-timers since the engine multiplies by
- *     actually-worked premium hours.
+ *   - Monthly employees: monthly_salary / hourlyDivisor(hours_per_week):
+ *     173 at the 40h default (common Swedish derivation for full-time
+ *     monthly → hourly, matches the timlön conventions used in CBAs), the
+ *     exact 52w formula for other schedules (arbetsschema-lite).
  */
 function effectiveHourlyRate(emp: {
   salary_type: 'monthly' | 'hourly'
   hourly_rate: number | null
   monthly_salary: number | null
+  hours_per_week?: number | null
 }): number {
   if (emp.salary_type === 'hourly') return emp.hourly_rate || 0
   const monthly = emp.monthly_salary || 0
-  return monthly > 0 ? Math.round((monthly / 173) * 100) / 100 : 0
+  return monthly > 0 ? Math.round((monthly / hourlyDivisor(emp.hours_per_week)) * 100) / 100 : 0
 }
 
 /** Benefit-type → line-item-type mapping for the derived benefit rows. */
@@ -143,7 +146,7 @@ export async function runSalaryCalculation(
   // 2. Load year config.
   const config = await loadPayrollConfig(supabase, paymentYear)
 
-  // 3. Load roster — `salary_run_employees` joined with employees + line items.
+  // 3. Load roster: `salary_run_employees` joined with employees + line items.
   // Defense-in-depth: filter by company_id too even though salary_run_id is a
   // foreign key. RLS already constrains the table per-company, but per
   // CLAUDE.md every query carries the company_id filter explicitly so a
@@ -157,13 +160,13 @@ export async function runSalaryCalculation(
   if (empError) {
     return { ok: false, code: 'DATABASE_ERROR', details: empError }
   }
-  // An empty roster is valid — a registered employer must still file a
+  // An empty roster is valid: a registered employer must still file a
   // nolldeklaration (HU-only AGI) for months without payroll. Calculation
   // then yields all-zero totals plus a frozen calculation_params snapshot,
   // and every downstream loop simply iterates zero times.
   const runEmployees = runEmployeesData ?? []
 
-  // 4. Pre-calculation validation — ensure every employee has the data the
+  // 4. Pre-calculation validation: ensure every employee has the data the
   //    engine needs. We accumulate ALL errors so the caller sees a complete
   //    list rather than fixing one and discovering the next on the retry.
   const validationErrors: string[] = []
@@ -247,13 +250,68 @@ export async function runSalaryCalculation(
     .eq('salary_run.status', 'booked')
     .lt('salary_run.period_month', run.period_month)
 
+  // 6b. Cutover opening balances (payroll gap-closure 2.2): a company that
+  //     switched to Accounted mid-year has YTD state from its previous
+  //     payroll system that no booked run here carries. Fetched BEFORE the
+  //     prior-run aggregation because the cutover month also decides which
+  //     booked runs count (see the exclusion in the loop below). YTD is
+  //     payslip display + reporting only: per-month tax lookup and the
+  //     per-month avgifter caps never read it.
+  const rosterEmployeeIds = runEmployees
+    .map((sre) => sre.employee?.id)
+    .filter((id): id is string => !!id)
+  const openingByEmployee = new Map<
+    string,
+    { cutoverDate: string; karensPeriodsAdjustment: number }
+  >()
+  const openingRowsTyped: Array<{
+    employee_id: string
+    cutover_date: string
+    ytd_gross: number
+    ytd_tax: number
+    ytd_net: number
+    karens_periods_adjustment: number
+  }> = []
+  if (rosterEmployeeIds.length > 0) {
+    const { data: openingRows } = await supabase
+      .from('employee_opening_balances')
+      .select('employee_id, cutover_date, ytd_gross, ytd_tax, ytd_net, karens_periods_adjustment')
+      .eq('company_id', companyId)
+      .in('employee_id', rosterEmployeeIds)
+
+    for (const opening of (openingRows || []) as typeof openingRowsTyped) {
+      openingRowsTyped.push(opening)
+      openingByEmployee.set(opening.employee_id, {
+        cutoverDate: opening.cutover_date,
+        karensPeriodsAdjustment: opening.karens_periods_adjustment ?? 0,
+      })
+    }
+  }
+
   const ytdByEmployee = new Map<string, { gross: number; tax: number; net: number }>()
-  for (const prior of (priorRuns || []) as Array<{
+  // Cast via unknown: supabase-js infers the to-one `salary_run` embed as an
+  // array, but PostgREST returns an object for a many-to-one relationship.
+  for (const prior of (priorRuns || []) as unknown as Array<{
     employee_id: string
     gross_salary: number
     tax_withheld: number
     net_salary: number
+    salary_run: { period_year: number; period_month: number }
   }>) {
+    // The opening balance is authoritative for pre-cutover YTD: a booked run
+    // backdated before the cutover month covers a month the opening already
+    // carries, so counting both would double the YTD.
+    const opening = openingByEmployee.get(prior.employee_id)
+    if (opening) {
+      const cutoverYear = Number(opening.cutoverDate.slice(0, 4))
+      const cutoverMonth = Number(opening.cutoverDate.slice(5, 7))
+      if (
+        prior.salary_run.period_year === cutoverYear &&
+        prior.salary_run.period_month < cutoverMonth
+      ) {
+        continue
+      }
+    }
     const current = ytdByEmployee.get(prior.employee_id) || { gross: 0, tax: 0, net: 0 }
     current.gross += prior.gross_salary
     current.tax += prior.tax_withheld
@@ -261,7 +319,23 @@ export async function runSalaryCalculation(
     ytdByEmployee.set(prior.employee_id, current)
   }
 
-  // 7. Pay period bounds — used to load per-day absence + worked-day records.
+  // Merge the opening YTD when the run's period is in the cutover year, on
+  // or after the cutover month (the month gate prevents double-count if
+  // someone backdates an in-system run before cutover).
+  for (const opening of openingRowsTyped) {
+    const cutoverYear = Number(opening.cutover_date.slice(0, 4))
+    const cutoverMonth = Number(opening.cutover_date.slice(5, 7))
+    const runOnOrAfterCutover =
+      run.period_year === cutoverYear && run.period_month >= cutoverMonth
+    if (!runOnOrAfterCutover) continue
+    const current = ytdByEmployee.get(opening.employee_id) || { gross: 0, tax: 0, net: 0 }
+    current.gross = roundOre(current.gross + (opening.ytd_gross || 0))
+    current.tax = roundOre(current.tax + (opening.ytd_tax || 0))
+    current.net = roundOre(current.net + (opening.ytd_net || 0))
+    ytdByEmployee.set(opening.employee_id, current)
+  }
+
+  // 7. Pay period bounds: used to load per-day absence + worked-day records.
   const periodYear = run.period_year as number
   const periodMonth = run.period_month as number
   const periodStart = `${periodYear}-${String(periodMonth).padStart(2, '0')}-01`
@@ -269,7 +343,7 @@ export async function runSalaryCalculation(
   const periodEnd = periodEndDate.toISOString().slice(0, 10)
 
   // 7b. Load active shift_premium_rules once per run. Filtered by company.
-  // Inactive rules excluded — the engine also re-checks, but this saves
+  // Inactive rules excluded: the engine also re-checks, but this saves
   // network bytes for companies with many archived rules.
   const { data: premiumRulesRaw, error: rulesError } = await supabase
     .from('shift_premium_rules')
@@ -289,7 +363,7 @@ export async function runSalaryCalculation(
   let totalVacationAccrual = 0
   let totalEmployerCost = 0
 
-  // Surfaced as warnings — UI / agent shows alongside the successful
+  // Surfaced as warnings: UI / agent shows alongside the successful
   // calculation, not an error.
   const lakarintygEmployees: string[] = []
   const fkReportingEmployees: string[] = []
@@ -299,7 +373,16 @@ export async function runSalaryCalculation(
     const emp = sre.employee
     if (!emp) continue
 
-    // 8a. Derive absence line items from per-day records.
+    // 8a. Derive absence line items from per-day records. The cutover karens
+    //     adjustment applies only while the 12-month högriskskydd lookback
+    //     still reaches into pre-cutover time; past that horizon the
+    //     adjustment is stale and imported day rows carry the truth.
+    const opening = openingByEmployee.get(emp.id)
+    const lookbackStartMs = Date.parse(`${periodStart}T00:00:00Z`) - 365 * 86_400_000
+    const karensAdjustmentApplies =
+      opening !== undefined &&
+      opening.karensPeriodsAdjustment > 0 &&
+      lookbackStartMs < Date.parse(`${opening.cutoverDate}T00:00:00Z`)
     const absenceResult = await loadAndDeriveAbsence({
       supabase,
       companyId,
@@ -308,6 +391,8 @@ export async function runSalaryCalculation(
       payrollConfig: config,
       periodStart,
       periodEnd,
+      karensPeriodsAdjustment: karensAdjustmentApplies ? opening.karensPeriodsAdjustment : 0,
+      dailyDivisor: dailyDivisor(emp.workdays_per_week),
     })
 
     // 8b. For hourly employees, derive worked hours from the calendar.
@@ -372,7 +457,7 @@ export async function runSalaryCalculation(
     // Refresh the monthly 'Grundlön' line so the displayed Lönerader table
     // matches the per-run monthly salary the engine actually uses. The engine
     // recomputes baseSalary from sre.monthly_salary (not from this line item),
-    // so this update is display-only — it keeps the row consistent after the
+    // so this update is display-only: it keeps the row consistent after the
     // user edits this month's salary on the draft.
     if (emp.salary_type === 'monthly') {
       const baseAmount =
@@ -511,6 +596,7 @@ export async function runSalaryCalculation(
         salary_type: emp.salary_type,
         hourly_rate: emp.hourly_rate,
         monthly_salary: sre.monthly_salary,
+        hours_per_week: emp.hours_per_week,
       })
       const shifts: WorkedDayShift[] = workedDayRows.map((row) => ({
         work_date: row.work_date,
@@ -620,6 +706,7 @@ export async function runSalaryCalculation(
         vacationRule: emp.vacation_rule,
         vacationDaysPerYear: emp.vacation_days_per_year,
         semestertillaggRate: emp.semestertillagg_rate,
+        dailyDivisor: dailyDivisor(emp.workdays_per_week),
         vaxaStodEligible: emp.vaxa_stod_eligible,
         vaxaStodStart: emp.vaxa_stod_start,
         vaxaStodEnd: emp.vaxa_stod_end,
@@ -767,15 +854,15 @@ export async function runSalaryCalculation(
     return { ok: false, code: 'DATABASE_ERROR', details: updateError }
   }
 
-  // 10. Warnings — non-blocking annotations the caller should surface.
+  // 10. Warnings: non-blocking annotations the caller should surface.
   const warnings: string[] = []
   if (taxTableSource === 'fallback') {
     warnings.push(
-      `Skatteverkets skattetabell-API är inte nåbart — beräkningen använder lokal reservdata för ${paymentYear}. Kontrollera att Skatteverket inte publicerat ändringar innan lönekörningen bokförs.`,
+      `Skatteverkets skattetabell-API är inte nåbart: beräkningen använder lokal reservdata för ${paymentYear}. Kontrollera att Skatteverket inte publicerat ändringar innan lönekörningen bokförs.`,
     )
   } else if (taxTableSource === 'mixed') {
     warnings.push(
-      `Skatteverkets skattetabell-API svarade bara delvis — vissa skattetabeller kommer från lokal reservdata för ${paymentYear}. Kontrollera att Skatteverket inte publicerat ändringar innan lönekörningen bokförs.`,
+      `Skatteverkets skattetabell-API svarade bara delvis: vissa skattetabeller kommer från lokal reservdata för ${paymentYear}. Kontrollera att Skatteverket inte publicerat ändringar innan lönekörningen bokförs.`,
     )
   }
   if (lakarintygEmployees.length > 0) {

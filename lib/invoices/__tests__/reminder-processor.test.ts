@@ -39,6 +39,7 @@ import {
   determineReminderLevel,
   calculateDaysOverdue,
 } from '../reminder-processor'
+import { getReminderDaysConfig } from '@/lib/email/reminder-templates'
 
 describe('determineReminderLevel', () => {
   it('returns null below the level-1 threshold', () => {
@@ -60,6 +61,37 @@ describe('determineReminderLevel', () => {
   it('returns null when all levels have been sent', () => {
     expect(determineReminderLevel(60, [1, 2, 3])).toBeNull()
   })
+
+  it('uses a company-specific schedule', () => {
+    const config = { 1: 7, 2: 21, 3: 35 } as const
+
+    expect(determineReminderLevel(6, [], config)).toBeNull()
+    expect(determineReminderLevel(7, [], config)).toBe(1)
+    expect(determineReminderLevel(21, [1], config)).toBe(2)
+    expect(determineReminderLevel(35, [1, 2], config)).toBe(3)
+  })
+})
+
+describe('getReminderDaysConfig', () => {
+  it('returns the existing defaults when no company settings are supplied', () => {
+    expect(getReminderDaysConfig()).toEqual({ 1: 15, 2: 30, 3: 45 })
+  })
+
+  it('returns configured company thresholds', () => {
+    expect(getReminderDaysConfig({
+      reminder_days_level_1: 5,
+      reminder_days_level_2: 10,
+      reminder_days_level_3: 20,
+    })).toEqual({ 1: 5, 2: 10, 3: 20 })
+  })
+
+  it('falls back to defaults for an invalid stored schedule', () => {
+    expect(getReminderDaysConfig({
+      reminder_days_level_1: 30,
+      reminder_days_level_2: 20,
+      reminder_days_level_3: 45,
+    })).toEqual({ 1: 15, 2: 30, 3: 45 })
+  })
 })
 
 describe('calculateDaysOverdue', () => {
@@ -72,7 +104,7 @@ describe('calculateDaysOverdue', () => {
   })
 })
 
-describe('processOverdueReminders — credit-note filter', () => {
+describe('processOverdueReminders: credit-note filter', () => {
   beforeEach(() => {
     chainCalls.length = 0
   })
@@ -86,7 +118,7 @@ describe('processOverdueReminders — credit-note filter', () => {
 
     expect(
       isCall,
-      'overdue-invoice query must filter out credit notes — credit notes have a negative total and must never trigger a payment reminder (e.g. KR-F2026002)',
+      'overdue-invoice query must filter out credit notes: credit notes have a negative total and must never trigger a payment reminder (e.g. KR-F2026002)',
     ).toBeDefined()
     expect(isCall?.args[1]).toBeNull()
   })

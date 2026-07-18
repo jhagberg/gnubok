@@ -12,6 +12,7 @@ import { VoucherSeriesManager } from '@/components/settings/VoucherSeriesManager
 import { VoucherSeriesPerSourceTypeForm } from '@/components/settings/VoucherSeriesPerSourceTypeForm'
 import { applyDefaultSeriesToMap } from '@/lib/bookkeeping/voucher-series-resolver'
 import { PeriodiseringAutoDetectToggle } from '@/components/settings/PeriodiseringAutoDetectToggle'
+import { DimensionsToggle } from '@/components/settings/DimensionsToggle'
 import { AccountingFrameworkForm } from '@/components/settings/AccountingFrameworkForm'
 import { useSettings } from '@/components/settings/useSettings'
 import { useCompany } from '@/contexts/CompanyContext'
@@ -41,17 +42,23 @@ export function BookkeepingSettingsContent() {
     const lockedThrough = (formData.get('bookkeeping_locked_through') as string) || null
     const accountingMethod = (formData.get('accounting_method') as string) || 'accrual'
     const defaultVoucherSeries = (formData.get('default_voucher_series') as string) || 'A'
+    // Deferred booking is an accrual-only concept (#967): normalize to false
+    // under kontantmetoden so switching back to accrual can never re-activate
+    // a stale flag the user set in a mode where it had no effect.
+    const deferInvoiceBooking =
+      accountingMethod === 'accrual' && formData.get('defer_invoice_booking') === 'true'
 
     const updates: Record<string, unknown> = {
       bookkeeping_locked_through: lockedThrough,
       auto_lock_period_days: autoLockValue === 'none' ? null : parseInt(autoLockValue),
       accounting_method: accountingMethod,
       default_voucher_series: defaultVoucherSeries,
+      defer_invoice_booking: deferInvoiceBooking,
     }
 
     // Write-through: the booking engine resolves the series from the
     // per-source-type map, NOT from default_voucher_series. So when the user
-    // changes the global default, propagate it across the map — but only for
+    // changes the global default, propagate it across the map, but only for
     // types that were still following the previous default, leaving explicit
     // per-type overrides (set via VoucherSeriesPerSourceTypeForm) untouched.
     // Without this the "Standardserie" dropdown is a no-op for bookkeeping.
@@ -109,6 +116,23 @@ export function BookkeepingSettingsContent() {
               {t('method_help')}
             </p>
           </div>
+          {/* #967: register/send without booking; ekonomi books in a separate
+              explicit step. Only meaningful under faktureringsmetoden. */}
+          <div className="space-y-2">
+            <Label htmlFor="defer_invoice_booking">{t('defer_booking_label')}</Label>
+            <select
+              id="defer_invoice_booking"
+              name="defer_invoice_booking"
+              defaultValue={settings.defer_invoice_booking ? 'true' : 'false'}
+              className="flex h-10 w-full max-w-xs rounded-md border border-input bg-background px-3 py-2 text-sm ring-offset-background focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2"
+            >
+              <option value="false">{t('defer_booking_off')}</option>
+              <option value="true">{t('defer_booking_on')}</option>
+            </select>
+            <p className="text-xs text-muted-foreground">
+              {t('defer_booking_help')}
+            </p>
+          </div>
         </section>
 
         {/* Default voucher series */}
@@ -147,7 +171,7 @@ export function BookkeepingSettingsContent() {
         <FiscalYearsManager />
       </div>
 
-      {/* Voucher series — per-source-type mapping */}
+      {/* Voucher series: per-source-type mapping */}
       <div className="border-t border-border pt-8">
         <VoucherSeriesPerSourceTypeForm
           settings={settings}
@@ -155,7 +179,7 @@ export function BookkeepingSettingsContent() {
         />
       </div>
 
-      {/* Voucher series — read-only display */}
+      {/* Voucher series: read-only display */}
       <div className="border-t border-border pt-8">
         <VoucherSeriesManager defaultSeries={settings.default_voucher_series || 'A'} />
       </div>
@@ -163,6 +187,11 @@ export function BookkeepingSettingsContent() {
       {/* Periodisering auto-detect toggle */}
       <div className="border-t border-border pt-8">
         <PeriodiseringAutoDetectToggle />
+      </div>
+
+      {/* Kostnadsställen & projekt (dimensions) toggle */}
+      <div className="border-t border-border pt-8">
+        <DimensionsToggle />
       </div>
 
       {/* Cross-links */}

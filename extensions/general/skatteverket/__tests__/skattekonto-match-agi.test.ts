@@ -60,6 +60,35 @@ describe('parseAgiPeriod', () => {
   it('rejects implausible years', () => {
     expect(parseAgiPeriod('Arbetsgivardeklaration 199912')).toBeNull()
   })
+
+  it('parses production month-name rows', () => {
+    expect(parseAgiPeriod('Avdragen skatt maj 2026')).toEqual({
+      year: 2026,
+      month: 5,
+    })
+    expect(parseAgiPeriod('Arbetsgivaravgift maj 2026')).toEqual({
+      year: 2026,
+      month: 5,
+    })
+    expect(parseAgiPeriod('ARBETSGIVARAVGIFT December 2026')).toEqual({
+      year: 2026,
+      month: 12,
+    })
+  })
+
+  it('parses the period from production beslut rows', () => {
+    // The 6-digit beslut date must not be mistaken for a YYYYMM period; the
+    // month-name token is the real period.
+    expect(parseAgiPeriod('Beslut 260703 arbetsgivaravgift mars 2026')).toEqual({
+      year: 2026,
+      month: 3,
+    })
+  })
+
+  it('does not treat unrelated month-name rows as AGI periods', () => {
+    expect(parseAgiPeriod('Intäktsränta maj 2026')).toBeNull()
+    expect(parseAgiPeriod('Moms maj 2026')).toBeNull()
+  })
 })
 
 // ──────────────────────────────────────────────────────────────────────
@@ -90,10 +119,10 @@ function lineRow(opts: {
   }
 }
 
-describe('findMatchSuggestionsBulk — AGI period disambiguation', () => {
+describe('findMatchSuggestionsBulk: AGI period disambiguation', () => {
   it('picks the AGI-linked entry even when two amount-matches exist', async () => {
     const { supabase, enqueue } = createQueuedMockSupabase()
-    // Two journal entries credit 1630 with the same amount — without period
+    // Two journal entries credit 1630 with the same amount: without period
     // disambiguation, this would be ambiguous and return no suggestion.
     enqueue({
       data: [
@@ -225,7 +254,7 @@ function txRow(overrides: Record<string, unknown> = {}) {
   }
 }
 
-describe('findMatchCandidates — AGI period boost', () => {
+describe('findMatchCandidates: AGI period boost', () => {
   it('moves the AGI-linked entry to position 0 even when a closer-by-date entry exists', async () => {
     const { supabase, enqueue } = createQueuedMockSupabase()
     enqueue({ data: txRow() })

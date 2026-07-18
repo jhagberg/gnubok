@@ -1,6 +1,7 @@
 import { NextResponse } from 'next/server'
 import { ensureInitialized } from '@/lib/init'
 import { createSalaryRunEntries } from '@/lib/salary/salary-entries'
+import { syncVacationLedgerForEmployees } from '@/lib/salary/vacation-ledger'
 import { eventBus } from '@/lib/events'
 import { withRouteContext } from '@/lib/api/with-route-context'
 import { errorResponse, errorResponseFromCode } from '@/lib/errors/get-structured-error'
@@ -33,7 +34,7 @@ export const POST = withRouteContext(
 
     const { data: employees, error: empError } = await supabase
       .from('salary_run_employees')
-      .select('*, employee:employees(employment_type), line_items:salary_line_items(*)')
+      .select('*, employee:employees(employment_type, default_dimensions), line_items:salary_line_items(*)')
       .eq('salary_run_id', id)
 
     if (empError) {
@@ -74,6 +75,17 @@ export const POST = withRouteContext(
         payload: { salaryRunId: id, entryIds: [], userId: user.id, companyId: companyId! },
       })
 
+      // Vacation ledger sync (non-fatal: the ledger recomputes and self-heals
+      // on the next booking; a sync bug must never block a booking).
+      const nollSync = await syncVacationLedgerForEmployees(
+        supabase,
+        companyId!,
+        roster.map((sre) => sre.employee_id),
+      )
+      if (!nollSync.ok) {
+        opLog.warn('vacation ledger sync failed after nollkörning booking', { message: nollSync.message })
+      }
+
       opLog.info('salary run booked as nollkörning (no journal entries)', { salaryRunId: id })
 
       return NextResponse.json({ data: bookedRun })
@@ -107,6 +119,9 @@ export const POST = withRouteContext(
             avgifter_rate: sre.avgifter_rate,
             vacation_accrual: sre.vacation_accrual,
             vacation_accrual_avgifter: sre.vacation_accrual_avgifter,
+            // Dimensions PR8: read-at-book from the employee row, the run
+            // review shows the same live bag, so preview matches booking.
+            default_dimensions: sre.employee?.default_dimensions ?? undefined,
             line_items: (sre.line_items || []).map((li: Record<string, unknown>) => ({
               item_type: li.item_type as string,
               amount: li.amount as number,
@@ -150,6 +165,16 @@ export const POST = withRouteContext(
         type: 'salary_run.booked',
         payload: { salaryRunId: id, entryIds, userId: user.id, companyId: companyId! },
       })
+
+      // Vacation ledger sync (non-fatal, see the nollkörning branch).
+      const ledgerSync = await syncVacationLedgerForEmployees(
+        supabase,
+        companyId!,
+        roster.map((sre) => sre.employee_id),
+      )
+      if (!ledgerSync.ok) {
+        opLog.warn('vacation ledger sync failed after booking', { message: ledgerSync.message })
+      }
 
       return NextResponse.json({ data: bookedRun })
     } catch (err) {

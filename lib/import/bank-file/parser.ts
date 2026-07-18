@@ -1,5 +1,5 @@
 /**
- * Bank file parser — main entry point
+ * Bank file parser: main entry point
  *
  * Auto-detects Swedish bank file formats and parses to normalized transactions.
  * Supports Nordea, SEB, Swedbank, Handelsbanken CSV and ISO 20022 camt.053 XML.
@@ -17,6 +17,7 @@ import { icaBankenFormat } from './formats/ica-banken'
 import { skandiaFormat } from './formats/skandia'
 import { lunarFormat } from './formats/lunar'
 import { northmillFormat } from './formats/northmill'
+import { wiseFormat } from './formats/wise'
 import { camt053Format } from './formats/camt053'
 import { genericCSVFormat } from './formats/generic-csv'
 
@@ -24,7 +25,7 @@ import { genericCSVFormat } from './formats/generic-csv'
  * Ordered list of format detectors.
  * camt.053 first (XML detection is unambiguous), then bank-specific CSV formats.
  * New bank formats go after existing ones but before generic_csv.
- * Generic CSV is last — it never auto-detects (manual fallback only).
+ * Generic CSV is last: it never auto-detects (manual fallback only).
  */
 const FORMATS: BankFileFormat[] = [
   camt053Format,
@@ -38,6 +39,7 @@ const FORMATS: BankFileFormat[] = [
   skandiaFormat,
   lunarFormat,
   northmillFormat,
+  wiseFormat,
   genericCSVFormat,
 ]
 
@@ -140,6 +142,13 @@ export function generateExternalId(
   // For camt.053, prefer the raw_line which contains the entry reference
   if (formatId === 'camt053' && tx.raw_line && !tx.raw_line.startsWith('camt053_entry_')) {
     return `camt053_${tx.raw_line}`
+  }
+
+  // Wise carries the stable transfer ID (TRANSFER-…, PLAN_ORDER-…, plus a
+  // `-fee` suffix for fee rows) in raw_line: use it so re-importing the same
+  // statement dedups exactly instead of relying on the row hash.
+  if (formatId === 'wise' && tx.raw_line) {
+    return `wise_${tx.raw_line}`
   }
 
   // For CSV formats, create a composite hash

@@ -43,6 +43,8 @@ function makeParsedFile(overrides?: Partial<ParsedSIEFile>): ParsedSIEFile {
     ],
     closingBalances: [],
     resultBalances: [],
+    dimensions: [],
+    dimensionValues: [],
     vouchers: [
       {
         series: 'A',
@@ -124,7 +126,7 @@ describe('generateImportPreview', () => {
         openingBalances: [
           { yearIndex: 0, account: '1510', amount: 50000 },
           { yearIndex: 0, account: '1930', amount: 100000 },
-          // Missing credit side — only 150000 debit, 0 credit
+          // Missing credit side: only 150000 debit, 0 credit
         ],
       })
       const mappings = [makeMapping('1510', '1510')]
@@ -222,7 +224,7 @@ describe('generateImportPreview', () => {
     it('passes parse issues to preview', () => {
       const parsed = makeParsedFile({
         issues: [
-          { severity: 'warning', line: 5, message: 'Okänd tagg: #FOO — ignoreras', tag: 'FOO' },
+          { severity: 'warning', line: 5, message: 'Okänd tagg: #FOO, ignoreras', tag: 'FOO' },
           { severity: 'error', line: 10, message: 'Invalid voucher', tag: 'VER' },
         ],
       })
@@ -268,7 +270,7 @@ describe('validateIBBalance', () => {
 
   it('returns large adjustment for file-level imbalance (unallocated årets resultat)', () => {
     // Simulates a Fortnox export where previous year result hasn't been allocated
-    // to equity — BS accounts don't balance because årets resultat is implicit
+    // to equity: BS accounts don't balance because årets resultat is implicit
     const parsed = makeParsedFile({
       openingBalances: [
         { yearIndex: 0, account: '1510', amount: 50100 },
@@ -278,14 +280,14 @@ describe('validateIBBalance', () => {
     const accountMap = new Map([['1510', '1510'], ['2440', '2440']])
     const result = validateIBBalance(parsed, accountMap)
 
-    // The adjustment is 100 SEK — caller should book to 2099, never reject
+    // The adjustment is 100 SEK: caller should book to 2099, never reject
     expect(result.roundingAdjustment).toBe(100)
     expect(result.fileImbalance).toBe(100)
     expect(result.excludedAccountsTotal).toBe(0)
   })
 
   it('tracks excluded accounts separately from file imbalance (Fortnox system accounts)', () => {
-    // Simulates Fortnox 0099 carrying IB balance — file is balanced,
+    // Simulates Fortnox 0099 carrying IB balance: file is balanced,
     // but mapped accounts are not because 0099 is excluded from mapping
     const parsed = makeParsedFile({
       openingBalances: [
@@ -312,7 +314,7 @@ describe('validateIBBalance', () => {
       openingBalances: [
         { yearIndex: 0, account: '1510', amount: 50000 },
         { yearIndex: 0, account: '2440', amount: -50000 },
-        { yearIndex: -1, account: '1510', amount: 99999 }, // Previous year — ignored
+        { yearIndex: -1, account: '1510', amount: 99999 }, // Previous year, ignored
       ],
     })
     const accountMap = new Map([['1510', '1510'], ['2440', '2440']])
@@ -331,8 +333,8 @@ describe('ensureFiscalPeriod validation', () => {
   it('rejects mid-month start when an earlier period already exists', async () => {
     const { supabase, enqueueMany } = createQueuedMockSupabase()
     enqueueMany([
-      { data: null, error: null }, // containing check — no match
-      { data: [], error: null },   // overlapping check — none
+      { data: null, error: null }, // containing check, no match
+      { data: [], error: null },   // overlapping check, none
       { data: [{ id: 'earlier' }], error: null }, // earlier period exists
     ])
 
@@ -387,13 +389,13 @@ describe('ensureFiscalPeriod validation', () => {
 
   it('allows mid-month start when importing a retroactive earliest period', async () => {
     // Scenario: onboarding created a 2026 fiscal period, user now imports
-    // an SIE for their förlängt första räkenskapsår 2017-07-28 – 2018-12-31.
+    // an SIE for their förlängt första räkenskapsår 2017-07-28 to 2018-12-31.
     // The 2017 period is chronologically earliest, so mid-month start is
     // legal under BFL 3 kap.
     const { supabase, enqueueMany } = createQueuedMockSupabase()
     enqueueMany([
-      { data: null, error: null }, // containing check — no match
-      { data: [], error: null },   // overlapping check — none (2017 vs 2026)
+      { data: null, error: null }, // containing check, no match
+      { data: [], error: null },   // overlapping check, none (2017 vs 2026)
       { data: [], error: null },   // no earlier period than 2017-07-28
       { data: [], error: null },   // no predecessor in the continuity chain
       { data: { id: 'retro-first-year-id' }, error: null }, // insert
@@ -429,11 +431,11 @@ describe('ensureFiscalPeriod validation', () => {
   it('rejects when an existing period overlaps the range but already has posted entries', async () => {
     // Regression: previously fell through to the overlapping period silently,
     // which stamped every imported voucher with a fiscal_period_id whose
-    // window did not cover the voucher's own entry_date — breaking the SIE
+    // window did not cover the voucher's own entry_date, breaking the SIE
     // invariant and BFL 5 kap. (verifikationsnummer per räkenskapsår).
     const { supabase, enqueueMany } = createQueuedMockSupabase()
     enqueueMany([
-      { data: null, error: null }, // containing check — no match
+      { data: null, error: null }, // containing check, no match
       {
         data: [
           {
@@ -448,14 +450,14 @@ describe('ensureFiscalPeriod validation', () => {
         ],
         error: null,
       },
-      { data: [{ id: 'entry-1' }], error: null }, // journal_entries — has at least one
+      { data: [{ id: 'entry-1' }], error: null }, // journal_entries: has at least one
     ])
 
     await expect(
       ensureFiscalPeriod(
         supabase as unknown as Supabase,
         'company-id',
-        '2025-03-01', // Capelix-style broken FY March–Feb
+        '2025-03-01', // Capelix-style broken FY March-Feb
         '2026-02-28',
       ),
     ).rejects.toThrow(/Inställningar → Företag/)
@@ -463,12 +465,12 @@ describe('ensureFiscalPeriod validation', () => {
 
   it('replaces an overlapping period when it is empty (onboarding-seeded)', async () => {
     // Real-world Zerify AB case: onboarding seeded Räkenskapsår 2026 =
-    // 2026-01-01 – 2026-12-31; the user has a förlängt första räkenskapsår
-    // 2025-10-20 – 2026-12-31 (BFL 3 kap.) and imports an SIE for it.
+    // 2026-01-01 to 2026-12-31; the user has a förlängt första räkenskapsår
+    // 2025-10-20 to 2026-12-31 (BFL 3 kap.) and imports an SIE for it.
     // The seeded period carries no data, so we replace it.
     const { supabase, enqueueMany } = createQueuedMockSupabase()
     enqueueMany([
-      { data: null, error: null }, // containing check — no match
+      { data: null, error: null }, // containing check, no match
       {
         data: [
           {
@@ -483,8 +485,8 @@ describe('ensureFiscalPeriod validation', () => {
         ],
         error: null,
       },
-      { data: [], error: null }, // journal_entries — none
-      { data: [], error: null }, // earlier-period check — none (mid-month start)
+      { data: [], error: null }, // journal_entries: none
+      { data: [], error: null }, // earlier-period check, none (mid-month start)
       { data: null, error: null }, // delete result
       { data: [], error: null }, // no predecessor in the continuity chain
       { data: { id: 'replaced-id' }, error: null }, // insert result
@@ -503,7 +505,7 @@ describe('ensureFiscalPeriod validation', () => {
 
   it('refuses to replace an overlapping period whose opening balances are already set', async () => {
     // opening_balances_set: true short-circuits the replaceability gate before
-    // we even look at journal_entries — the period clearly carries user data.
+    // we even look at journal_entries: the period clearly carries user data.
     const { supabase, enqueueMany } = createQueuedMockSupabase()
     enqueueMany([
       { data: null, error: null },
@@ -796,20 +798,17 @@ describe('computeVoucherNumberRanges', () => {
   })
 })
 
-describe('importVouchers — per-voucher series preservation', () => {
+describe('importVouchers: per-voucher series preservation', () => {
   // Captures the rows passed to `.insert()` so the test can assert on
   // voucher_series per inserted record. Uses a hand-rolled mock rather than
   // createQueuedMockSupabase because we need to inspect arguments, not just
   // return queued data.
-  function buildCapturingSupabase() {
+  function buildCapturingSupabase(options: { failImportRpc?: boolean } = {}) {
     const journalEntryInserts: Array<Record<string, unknown>> = []
     const journalEntryLineInserts: Array<Record<string, unknown>> = []
     const rpcCalls: Array<{ name: string; args: Record<string, unknown> }> = []
 
-    // Each `next_voucher_number` RPC call auto-increments per series, matching
-    // the DB function's ON CONFLICT behavior.
     const nextNumberBySeries = new Map<string, number>()
-
     let syntheticEntryId = 1
 
     const supabase = {
@@ -831,52 +830,56 @@ describe('importVouchers — per-voucher series preservation', () => {
           }
         }
 
-        if (table === 'journal_entries') {
-          return {
-            insert: (rows: Array<Record<string, unknown>>) => {
-              journalEntryInserts.push(...rows)
-              return {
-                select: () => ({
-                  then: (resolve: (v: { data: { id: string }[]; error: null }) => void) =>
-                    resolve({
-                      data: rows.map(() => ({ id: `entry-${syntheticEntryId++}` })),
-                      error: null,
-                    }),
-                }),
-              }
-            },
-          }
-        }
-
-        if (table === 'journal_entry_lines') {
-          return {
-            insert: (rows: Array<Record<string, unknown>>) => {
-              journalEntryLineInserts.push(...rows)
-              return Promise.resolve({ error: null })
-            },
-          }
-        }
-
         throw new Error(`Unexpected table: ${table}`)
       }),
 
       rpc: vi.fn(async (name: string, args: Record<string, unknown>) => {
         rpcCalls.push({ name, args })
-        if (name === 'next_voucher_number') {
-          const series = args.p_series as string
-          const current = nextNumberBySeries.get(series) ?? 0
-          const next = current + 1
-          nextNumberBySeries.set(series, next)
-          return { data: next, error: null }
-        }
-        if (name === 'reserve_voucher_range') {
-          const series = args.p_series as string
-          const highest = args.p_highest_used as number
-          nextNumberBySeries.set(series, highest)
-          return { data: null, error: null }
-        }
-        if (name === 'release_voucher_range') {
-          return { data: null, error: null }
+        if (name === 'import_sie_journal_entries') {
+          if (options.failImportRpc) {
+            return {
+              data: null,
+              error: { message: 'line insert failed' },
+            }
+          }
+
+          const entries = args.p_entries as Array<{
+            sourceId: string
+            series: string
+            sourceType: string
+            lines: Array<Record<string, unknown>>
+          }>
+          const inserted_entries = entries.map((entry) => {
+            const current = nextNumberBySeries.get(entry.series) ?? 0
+            const next = current + 1
+            nextNumberBySeries.set(entry.series, next)
+            const id = `entry-${syntheticEntryId++}`
+            journalEntryInserts.push({
+              ...entry,
+              id,
+              voucher_series: entry.series,
+              voucher_number: next,
+              source_type: entry.sourceType,
+              source_voucher_series: (entry as { sourceSeries?: string | null }).sourceSeries ?? null,
+              source_voucher_number: (entry as { sourceNumber?: number | null }).sourceNumber ?? null,
+            })
+            journalEntryLineInserts.push(...entry.lines.map((line) => ({ ...line, journal_entry_id: id })))
+            return {
+              id,
+              sourceId: entry.sourceId,
+              series: entry.series,
+              voucherNumber: next,
+              sourceType: entry.sourceType,
+            }
+          })
+          return {
+            data: {
+              inserted_entries,
+              skipped_duplicates: [],
+              validation_errors: [],
+            },
+            error: null,
+          }
         }
         throw new Error(`Unexpected RPC: ${name}`)
       }),
@@ -930,7 +933,7 @@ describe('importVouchers — per-voucher series preservation', () => {
       'period-1',
       parsed,
       baseMap,
-      'B', // fallback (should not be used here — all vouchers have series)
+      'B', // fallback (should not be used here: all vouchers have series)
     )
 
     expect(result.created).toBe(4)
@@ -939,9 +942,9 @@ describe('importVouchers — per-voucher series preservation', () => {
     const seriesInInserts = journalEntryInserts.map((r) => r.voucher_series)
     expect(seriesInInserts).toEqual(['B', 'B', 'C', 'V'])
 
-    // Each series reserves its own voucher-number range independently
-    const reserveCalls = rpcCalls.filter((c) => c.name === 'reserve_voucher_range')
-    expect(reserveCalls.map((c) => c.args.p_series)).toEqual(['B', 'C', 'V'])
+    const importCalls = rpcCalls.filter((c) => c.name === 'import_sie_journal_entries')
+    expect(importCalls).toHaveLength(1)
+    expect((importCalls[0].args.p_entries as Array<{ series: string }>).map((e) => e.series)).toEqual(['B', 'B', 'C', 'V'])
   })
 
   it('falls back to defaultSeries when source voucher has empty series (SIE4I)', async () => {
@@ -1022,14 +1025,14 @@ describe('importVouchers — per-voucher series preservation', () => {
       .filter((r) => r.voucher_series === 'C')
       .map((r) => r.voucher_number)
 
-    // Each series starts at 1 and increments independently — not globally continuous
+    // Each series starts at 1 and increments independently, not globally continuous
     expect(bNumbers).toEqual([1, 2, 3])
     expect(cNumbers).toEqual([1, 2])
   })
 
   it('preserves original source series/number on each imported entry, even across skipped vouchers', async () => {
     const { supabase, journalEntryInserts } = buildCapturingSupabase()
-    // A2 is an empty voucher (no lines) — will be skipped. A1 and A3 survive.
+    // A2 is an empty voucher (no lines), will be skipped. A1 and A3 survive.
     // Accounted assigns target numbers 1 and 2 (contiguous), but source_voucher_number
     // must preserve the SIE originals (1 and 3) so traceability is not lost.
     const parsed = makeParsedFile({
@@ -1055,6 +1058,35 @@ describe('importVouchers — per-voucher series preservation', () => {
     expect(journalEntryInserts.map((r) => r.voucher_number)).toEqual([1, 2])
     expect(journalEntryInserts.map((r) => r.source_voucher_series)).toEqual(['A', 'A'])
     expect(journalEntryInserts.map((r) => r.source_voucher_number)).toEqual([1, 3])
+  })
+
+  it('does not report imported IDs or counts when the atomic RPC fails', async () => {
+    const { supabase, journalEntryInserts, journalEntryLineInserts } = buildCapturingSupabase({
+      failImportRpc: true,
+    })
+    const parsed = makeParsedFile({
+      vouchers: [
+        makeVoucher('A', 1),
+      ],
+    })
+
+    const result = await importVouchers(
+      supabase,
+      'company-1',
+      'user-1',
+      'period-1',
+      parsed,
+      baseMap,
+      'A',
+    )
+
+    expect(result.created).toBe(0)
+    expect(result.ids).toEqual([])
+    expect(result.importTypedIds).toEqual([])
+    expect(result.voucherNumberMapping).toEqual([])
+    expect(result.errors.join(' ')).toContain('line insert failed')
+    expect(journalEntryInserts).toEqual([])
+    expect(journalEntryLineInserts).toEqual([])
   })
 
   it('stores NULL source series/number when the source voucher has no series (SIE4I subsystem import)', async () => {

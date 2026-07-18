@@ -43,6 +43,7 @@ function LoginPageContent() {
   const router = useRouter()
   const searchParams = useSearchParams()
   const callbackError = searchParams.get('error')
+  const callbackFlow = searchParams.get('flow')
   const supabase = createClient()
   const bankIdEnabled = isBankIdEnabled()
   const tAuth = useTranslations('auth')
@@ -385,20 +386,33 @@ function LoginPageContent() {
         <div className="rounded-lg border bg-card p-6">
           {callbackError === 'auth_error' && (
             <div className="mb-5 rounded-lg border border-destructive/30 bg-destructive/5 p-4">
-              <p className="text-sm font-medium text-destructive">
-                {tAuth('callback_error_title')}
-              </p>
-              <p className="mt-1 text-sm text-destructive/90">
-                {tAuth('callback_error_body')}{' '}
-                <button
-                  type="button"
-                  onClick={() => setShowResetPassword(true)}
-                  className="font-medium underline underline-offset-2"
-                >
-                  {tAuth('request_new_reset_link')}
-                </button>
-                .
-              </p>
+              {callbackFlow === 'recovery' ? (
+                <>
+                  <p className="text-sm font-medium text-destructive">
+                    {tAuth('callback_error_title')}
+                  </p>
+                  <p className="mt-1 text-sm text-destructive/90">
+                    {tAuth('callback_error_body')}{' '}
+                    <button
+                      type="button"
+                      onClick={() => setShowResetPassword(true)}
+                      className="font-medium underline underline-offset-2"
+                    >
+                      {tAuth('request_new_reset_link')}
+                    </button>
+                    .
+                  </p>
+                </>
+              ) : (
+                <>
+                  <p className="text-sm font-medium text-destructive">
+                    {tAuth('callback_error_title_signup')}
+                  </p>
+                  <p className="mt-1 text-sm text-destructive/90">
+                    {tAuth('callback_error_body_signup')}
+                  </p>
+                </>
+              )}
             </div>
           )}
           {bankIdEnabled && (
@@ -412,13 +426,12 @@ function LoginPageContent() {
                     {tAuth('bankid_no_account_body')}
                   </p>
                   <p className="mt-2">
-                    <button
-                      type="button"
-                      onClick={() => setBankIdNoAccount(null)}
+                    <Link
+                      href="/register"
                       className="text-xs text-amber-600 underline underline-offset-2 hover:text-amber-800 dark:text-amber-400"
                     >
                       {tAuth('bankid_no_account_create')}
-                    </button>
+                    </Link>
                   </p>
                 </div>
               ) : (

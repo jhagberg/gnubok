@@ -12,7 +12,7 @@ import { parseGenericCSV, normalizeMinusSign } from '../formats/generic-csv'
 import { parseCSVLine } from '../formats/nordea'
 
 // ---------------------------------------------------------------------------
-// Test data — realistic CSV/XML content for each Swedish bank format
+// Test data: realistic CSV/XML content for each Swedish bank format
 // ---------------------------------------------------------------------------
 
 const NORDEA_CSV = [
@@ -199,6 +199,15 @@ const LUNAR_CSV = [
   '2024-01-13,LÖNEUTBETALNING,"25.000,00","12.877,17"',
 ].join('\n')
 
+// Real Lunar export as of 2026: Time and Transaction ID columns, "Title"
+// instead of "Text", SPACE thousands separator, UTF-8 BOM (issue #915).
+const LUNAR_CSV_2026 = '\uFEFF' + [
+  'Date,Time,Title,Amount,Balance,Transaction ID',
+  '2026-06-30,12:11,Incoming payment,"12 345,00","98 764,94",7f0a4c9e-1111-2222-3333-444455556666',
+  '2026-06-12,05:47,Fee,"-1,49","86 419,94",7f0a4c9e-1111-2222-3333-444455557777',
+  '2026-05-12,05:47,Card purchase,"-2 500,00","86 421,43",7f0a4c9e-1111-2222-3333-444455558888',
+].join('\n')
+
 // Northmill exports include a 5-line metadata preamble (Kontonummer, Saldo,
 // Kontohavare, Org. Nr, Period) plus blank lines before the actual transaction
 // header. Negative amounts use Unicode minus (U+2212), not ASCII hyphen.
@@ -308,7 +317,7 @@ describe('detectFileFormat', () => {
   })
 
   it('does not confuse Nordea Datum variant with Länsförsäkringar (which has Datum + Typ)', () => {
-    // Nordea Format D has Datum without Typ — must not be mistaken for LF
+    // Nordea Format D has Datum without Typ: must not be mistaken for LF
     const format = detectFileFormat(NORDEA_BUSINESS_CSV_VARIANT_C, 'export.csv')
     expect(format!.id).toBe('nordea_business')
   })
@@ -404,6 +413,12 @@ describe('detectFileFormat', () => {
     expect(format!.id).toBe('lunar')
   })
 
+  it('detects the 2026 Lunar CSV header (Title column, BOM) as lunar', () => {
+    const format = detectFileFormat(LUNAR_CSV_2026, 'lunar.csv')
+    expect(format).not.toBeNull()
+    expect(format!.id).toBe('lunar')
+  })
+
   it('detects Northmill CSV from Kontonummer preamble + transaction header', () => {
     const format = detectFileFormat(NORTHMILL_CSV, 'Northmill-Account-Statement.csv')
     expect(format).not.toBeNull()
@@ -416,7 +431,7 @@ describe('detectFileFormat', () => {
       '2024-01-15,Överföring kontonummer 1234,Inkomst,"100,00","1000,00"',
     ].join('\n')
     const format = detectFileFormat(fake, 'test.csv')
-    // Should detect as Nordea, not Northmill — Northmill needs Kontonummer at start of first line
+    // Should detect as Nordea, not Northmill: Northmill needs Kontonummer at start of first line
     expect(format!.id).toBe('nordea')
   })
 
@@ -447,7 +462,7 @@ describe('detectFileFormat', () => {
   })
 })
 
-describe('parseBankFile — Nordea format', () => {
+describe('parseBankFile: Nordea format', () => {
   it('parses comma-delimited CSV with comma decimal separator', () => {
     const result = parseBankFile(NORDEA_CSV, 'nordea.csv')
 
@@ -524,7 +539,7 @@ describe('parseBankFile — Nordea format', () => {
   })
 })
 
-describe('parseBankFile — Nordea Business format', () => {
+describe('parseBankFile: Nordea Business format', () => {
   it('parses semicolon-delimited CSV with correct columns', () => {
     const result = parseBankFile(NORDEA_BUSINESS_CSV, 'nordea_ftg.csv')
 
@@ -555,10 +570,10 @@ describe('parseBankFile — Nordea Business format', () => {
     const result = parseBankFile(NORDEA_BUSINESS_CSV, 'nordea_ftg.csv')
 
     const spotify = result.transactions[0]
-    expect(spotify.description).toBe('SPOTIFY AB — Kortköp')
+    expect(spotify.description).toBe('SPOTIFY AB - Kortköp')
 
     const salary = result.transactions[2]
-    expect(salary.description).toBe('ARBETSGIVAREN AB — Löneutbetalning')
+    expect(salary.description).toBe('ARBETSGIVAREN AB - Löneutbetalning')
   })
 
   it('extracts counterparty from Mottagare (expense) or Avsändare (income)', () => {
@@ -622,7 +637,7 @@ describe('parseBankFile — Nordea Business format', () => {
   })
 })
 
-describe('parseBankFile — Nordea Business variant A (Betalare/Mottagare)', () => {
+describe('parseBankFile: Nordea Business variant A (Betalare/Mottagare)', () => {
   it('parses the alternate Nordea Business format with combined party column', () => {
     const result = parseBankFile(NORDEA_BUSINESS_CSV_VARIANT_A, 'nordea_ftg.csv')
 
@@ -634,8 +649,8 @@ describe('parseBankFile — Nordea Business variant A (Betalare/Mottagare)', () 
   it('builds description from Betalningstyp and Meddelande/Referens', () => {
     const result = parseBankFile(NORDEA_BUSINESS_CSV_VARIANT_A, 'nordea_ftg.csv')
 
-    expect(result.transactions[0].description).toBe('Kortbetalning — Spotify Premium')
-    expect(result.transactions[2].description).toBe('Inbetalning — Lön jan')
+    expect(result.transactions[0].description).toBe('Kortbetalning - Spotify Premium')
+    expect(result.transactions[2].description).toBe('Inbetalning - Lön jan')
   })
 
   it('extracts counterparty from combined Betalare/Mottagare column', () => {
@@ -654,7 +669,7 @@ describe('parseBankFile — Nordea Business variant A (Betalare/Mottagare)', () 
   })
 })
 
-describe('parseBankFile — Nordea Business variant B (Bokföringsdatum)', () => {
+describe('parseBankFile: Nordea Business variant B (Bokföringsdatum)', () => {
   it('parses the simple Nordea Business format with Bokföringsdatum', () => {
     const result = parseBankFile(NORDEA_BUSINESS_CSV_VARIANT_B, 'nordea_ftg.csv')
 
@@ -687,7 +702,7 @@ describe('parseBankFile — Nordea Business variant B (Bokföringsdatum)', () =>
   })
 })
 
-describe('parseBankFile — Nordea Business variant C (Datum + YYYY/MM/DD)', () => {
+describe('parseBankFile: Nordea Business variant C (Datum + YYYY/MM/DD)', () => {
   it('parses the Nordea format with Datum header and slash dates', () => {
     const result = parseBankFile(NORDEA_BUSINESS_CSV_VARIANT_C, 'nordea_ftg.csv')
 
@@ -743,7 +758,7 @@ describe('parseBankFile — Nordea Business variant C (Datum + YYYY/MM/DD)', () 
   })
 })
 
-describe('parseBankFile — SEB format', () => {
+describe('parseBankFile: SEB format', () => {
   it('parses semicolon-delimited CSV with comma decimal separator', () => {
     const result = parseBankFile(SEB_CSV, 'seb.csv')
 
@@ -811,7 +826,7 @@ describe('parseBankFile — SEB format', () => {
   })
 })
 
-describe('parseBankFile — Swedbank format', () => {
+describe('parseBankFile: Swedbank format', () => {
   it('parses comma-delimited CSV with PERIOD decimal separator', () => {
     const result = parseBankFile(SWEDBANK_CSV, 'swedbank.csv')
 
@@ -859,7 +874,7 @@ describe('parseBankFile — Swedbank format', () => {
   })
 })
 
-describe('parseBankFile — Handelsbanken format', () => {
+describe('parseBankFile: Handelsbanken format', () => {
   it('parses semicolon-delimited CSV with comma decimal separator', () => {
     const result = parseBankFile(HANDELSBANKEN_CSV, 'handelsbanken.csv')
 
@@ -948,7 +963,7 @@ describe('parseBankFile — Handelsbanken format', () => {
   })
 })
 
-describe('parseBankFile — Länsförsäkringar format', () => {
+describe('parseBankFile: Länsförsäkringar format', () => {
   it('parses semicolon-delimited CSV with quoted fields and comma decimal separator', () => {
     const result = parseBankFile(LANSFORSAKRINGAR_CSV, 'lf.csv')
 
@@ -1000,7 +1015,7 @@ describe('parseBankFile — Länsförsäkringar format', () => {
   })
 })
 
-describe('parseBankFile — ICA Banken format', () => {
+describe('parseBankFile: ICA Banken format', () => {
   it('parses semicolon-delimited CSV with metadata rows before header', () => {
     const result = parseBankFile(ICA_BANKEN_CSV, 'ica.csv')
 
@@ -1052,7 +1067,7 @@ describe('parseBankFile — ICA Banken format', () => {
   })
 })
 
-describe('parseBankFile — Skandia format', () => {
+describe('parseBankFile: Skandia format', () => {
   it('parses semicolon-delimited CSV with comma decimal separator', () => {
     const result = parseBankFile(SKANDIA_CSV, 'skandia.csv')
 
@@ -1105,7 +1120,7 @@ describe('parseBankFile — Skandia format', () => {
   })
 })
 
-describe('parseBankFile — Lunar format', () => {
+describe('parseBankFile: Lunar format', () => {
   it('parses comma-delimited CSV with English headers', () => {
     const result = parseBankFile(LUNAR_CSV, 'lunar.csv')
 
@@ -1156,9 +1171,61 @@ describe('parseBankFile — Lunar format', () => {
     expect(nordeaResult!.id).toBe('nordea')
     expect(lunarResult!.id).toBe('lunar')
   })
+
+  // Regression tests for issue #915: the real 2026 Lunar export uses a SPACE
+  // thousands separator ("12 345,00") and a "Title" column instead of "Text".
+  it('parses 2026 Lunar amounts with space thousands separator without truncation', () => {
+    const result = parseBankFile(LUNAR_CSV_2026, 'lunar.csv')
+
+    expect(result.format).toBe('lunar')
+    expect(result.transactions).toHaveLength(3)
+    expect(result.issues).toHaveLength(0)
+
+    expect(result.transactions[0].amount).toBe(12345)
+    expect(result.transactions[1].amount).toBe(-1.49)
+    expect(result.transactions[2].amount).toBe(-2500)
+  })
+
+  it('parses 2026 Lunar balance with space thousands separator', () => {
+    const result = parseBankFile(LUNAR_CSV_2026, 'lunar.csv')
+
+    expect(result.transactions[0].balance).toBe(98764.94)
+    expect(result.transactions[1].balance).toBe(86419.94)
+    expect(result.transactions[2].balance).toBe(86421.43)
+  })
+
+  it('takes the description from the Title column in the 2026 format', () => {
+    const result = parseBankFile(LUNAR_CSV_2026, 'lunar.csv')
+
+    expect(result.transactions[0].description).toBe('Incoming payment')
+    expect(result.transactions[1].description).toBe('Fee')
+    expect(result.transactions[2].description).toBe('Card purchase')
+  })
+
+  it('calculates 2026 format stats and date range correctly', () => {
+    const result = parseBankFile(LUNAR_CSV_2026, 'lunar.csv')
+
+    expect(result.stats.total_income).toBe(12345)
+    expect(result.stats.total_expenses).toBe(-2501.49)
+    expect(result.stats.parsed_rows).toBe(3)
+    expect(result.date_from).toBe('2026-05-12')
+    expect(result.date_to).toBe('2026-06-30')
+  })
+
+  it('still parses the legacy Lunar period thousands separator ("1.234,56")', () => {
+    const legacy = [
+      'Date,Text,Amount,Balance',
+      '2024-01-15,PAYMENT,"1.234,56","10.000,00"',
+    ].join('\n')
+    const result = parseBankFile(legacy, 'lunar.csv')
+
+    expect(result.format).toBe('lunar')
+    expect(result.transactions[0].amount).toBe(1234.56)
+    expect(result.transactions[0].balance).toBe(10000)
+  })
 })
 
-describe('parseBankFile — Northmill format', () => {
+describe('parseBankFile: Northmill format', () => {
   it('skips the 5-line metadata preamble and blank lines, parses transaction rows', () => {
     const result = parseBankFile(NORTHMILL_CSV, 'Northmill.csv')
 
@@ -1171,7 +1238,7 @@ describe('parseBankFile — Northmill format', () => {
   it('correctly parses negative amounts that use Unicode minus (U+2212)', () => {
     const result = parseBankFile(NORTHMILL_CSV, 'Northmill.csv')
 
-    // First transaction is "−139,00" with U+2212 — must become -139, not NaN
+    // First transaction is "−139,00" with U+2212: must become -139, not NaN
     expect(result.transactions[0].amount).toBe(-139)
     expect(result.transactions[0].description).toBe('Månadsavgift företagspaket april')
     expect(result.transactions[0].date).toBe('2026-04-01')
@@ -1205,7 +1272,7 @@ describe('parseBankFile — Northmill format', () => {
   })
 })
 
-describe('parseBankFile — camt.053 XML format', () => {
+describe('parseBankFile: camt.053 XML format', () => {
   it('parses XML with credit and debit entries', () => {
     const result = parseBankFile(CAMT053_XML, 'statement.xml')
 
@@ -1272,7 +1339,7 @@ describe('parseBankFile — camt.053 XML format', () => {
   })
 })
 
-describe('parseBankFile — explicit format override', () => {
+describe('parseBankFile: explicit format override', () => {
   it('uses the specified format instead of auto-detection', () => {
     // Force parsing Nordea content as SEB (will produce issues but should use SEB format)
     const result = parseBankFile(
@@ -1756,7 +1823,7 @@ describe('edge cases and robustness', () => {
 
 // --- Fix 5: SEB duplicate condition removal ---
 
-describe('SEB detection — no duplicate conditions', () => {
+describe('SEB detection: no duplicate conditions', () => {
   it('detects SEB with bokföringsdag header', () => {
     const content = 'Bokföringsdag;Valutadag;Text;Belopp;Saldo\n2024-01-15;2024-01-15;Test;-100,00;5000,00'
     const format = detectFileFormat(content, 'seb.csv')
@@ -1774,7 +1841,7 @@ describe('SEB detection — no duplicate conditions', () => {
 
 // --- Fix 6: Länsförsäkringar false positive prevention ---
 
-describe('Länsförsäkringar detection — false positive prevention', () => {
+describe('Länsförsäkringar detection: false positive prevention', () => {
   it('detects valid LF data rows with comma-decimal amounts', () => {
     const format = detectFileFormat(LANSFORSAKRINGAR_CSV, 'lf.csv')
     expect(format).not.toBeNull()
@@ -1801,7 +1868,7 @@ describe('Länsförsäkringar detection — false positive prevention', () => {
 
 // --- Fix 7: Generic CSV column bounds checking ---
 
-describe('parseGenericCSV — column bounds checking', () => {
+describe('parseGenericCSV: column bounds checking', () => {
   it('skips rows with too few columns and adds warning', () => {
     const content = [
       'Date,Description,Amount',
@@ -1868,7 +1935,7 @@ describe('parseGenericCSV — column bounds checking', () => {
     expect(result.issues).toHaveLength(0)
   })
 
-  it('parses amounts that use Unicode minus (U+2212) — was NaN before normalization', () => {
+  it('parses amounts that use Unicode minus (U+2212): was NaN before normalization', () => {
     const content = [
       'Date,Description,Amount',
       '2024-01-15,SPOTIFY,"\u221299,00"',
@@ -1945,7 +2012,7 @@ describe('normalizeMinusSign', () => {
 
 // --- Fix 8: parseCSVLine unclosed quote handling ---
 
-describe('parseCSVLine — unclosed quote handling', () => {
+describe('parseCSVLine: unclosed quote handling', () => {
   it('handles normal quoted fields correctly', () => {
     const fields = parseCSVLine('"hello","world"', ',')
     expect(fields).toEqual(['hello', 'world'])
@@ -1976,5 +2043,127 @@ describe('parseCSVLine — unclosed quote handling', () => {
   it('handles semicolon delimiter with quotes', () => {
     const fields = parseCSVLine('"2024-01-15";"SPOTIFY AB";"-99,00"', ';')
     expect(fields).toEqual(['2024-01-15', 'SPOTIFY AB', '-99,00'])
+  })
+})
+
+// ---------------------------------------------------------------------------
+// Wise (TransferWise) multi-currency transaction history
+// ---------------------------------------------------------------------------
+
+const WISE_HEADER =
+  'ID,Status,Direction,"Created on","Finished on","Source fee amount","Source fee currency","Target fee amount","Target fee currency","Source name","Source amount (after fees)","Source currency","Target name","Target amount (after fees)","Target currency","Exchange rate",Reference,Batch,"Created by",Category,Note'
+
+const WISE_CSV = [
+  WISE_HEADER,
+  'TRANSFER-2247230173,COMPLETED,IN,"2026-07-13 13:39:01","2026-07-13 13:39:08",,,,,"Bluedot Impact Ltd",2500.0,USD,"Aligned Intelligence AB",2500.0,USD,1,Facilitation,,,"Money added",',
+  'TRANSFER-2214309703,COMPLETED,IN,"2026-06-26 20:53:33","2026-06-26 20:54:14",2.20,SEK,,,"Aligned Intelligence AB",200.0,SEK,"Aligned Intelligence AB",200.0,SEK,1.0,,,"Peter Alexander Reinthal","Money added",',
+  'PLAN_ORDER-28688820,COMPLETED,OUT,"2026-06-24 06:13:45","2026-06-24 06:41:51",,,,,,520.00,SEK,TransferWise,520.00,SEK,1.00000000,28688820,,"Peter Alexander Reinthal",General,',
+  'TRANSFER-2208605608,COMPLETED,IN,"2026-06-24 06:13:45","2026-06-24 06:41:50",0.00,SEK,,,"Aligned Intelligence AB",520.0,SEK,"Aligned Intelligence AB",520.0,SEK,1.0,invoice-28688820,,"Peter Alexander Reinthal","Money added",',
+].join('\n')
+
+describe('Wise format', () => {
+  it('auto-detects the Wise header', () => {
+    const format = detectFileFormat(WISE_CSV, 'transactionhistory.csv')
+    expect(format?.id).toBe('wise')
+  })
+
+  const byId = (txs: ParsedBankTransaction[], id: string) => txs.find((t) => t.raw_line === id)
+
+  it('signs IN as income and OUT as expense, on the moved-side currency', () => {
+    const result = parseBankFile(WISE_CSV, 'wise.csv')
+    expect(result.format).toBe('wise')
+
+    const usdIn = byId(result.transactions, 'TRANSFER-2247230173')
+    expect(usdIn).toMatchObject({ amount: 2500, currency: 'USD', date: '2026-07-13' })
+
+    const sekOut = byId(result.transactions, 'PLAN_ORDER-28688820')
+    expect(sekOut).toMatchObject({ amount: -520, currency: 'SEK', date: '2026-06-24' })
+    expect(sekOut?.counterparty).toBe('TransferWise')
+  })
+
+  it('emits a non-zero fee as its own negative "Wise avgift" row', () => {
+    const result = parseBankFile(WISE_CSV, 'wise.csv')
+    const fee = byId(result.transactions, 'TRANSFER-2214309703-fee')
+    expect(fee).toBeDefined()
+    expect(fee?.amount).toBe(-2.2)
+    expect(fee?.currency).toBe('SEK')
+    expect(fee?.description).toMatch(/^Wise avgift/)
+
+    // A 0.00 fee produces no extra row.
+    expect(byId(result.transactions, 'TRANSFER-2208605608-fee')).toBeUndefined()
+    // 4 movements + 1 fee row.
+    expect(result.transactions).toHaveLength(5)
+  })
+
+  it('keys external_id on the stable Wise ID, including fee rows', () => {
+    const result = parseBankFile(WISE_CSV, 'wise.csv')
+    const main = byId(result.transactions, 'TRANSFER-2247230173')!
+    const fee = byId(result.transactions, 'TRANSFER-2214309703-fee')!
+    expect(generateExternalId(main, 'wise', 0)).toBe('wise_TRANSFER-2247230173')
+    expect(generateExternalId(fee, 'wise', 1)).toBe('wise_TRANSFER-2214309703-fee')
+  })
+
+  it('skips rows that are not COMPLETED', () => {
+    const withCancelled = [
+      WISE_HEADER,
+      'TRANSFER-9,CANCELLED,IN,"2026-06-01 10:00:00","2026-06-01 10:00:00",,,,,"X",100.0,SEK,"Y",100.0,SEK,1,,,,General,',
+      'TRANSFER-2247230173,COMPLETED,IN,"2026-07-13 13:39:01","2026-07-13 13:39:08",,,,,"Bluedot Impact Ltd",2500.0,USD,"Aligned Intelligence AB",2500.0,USD,1,Facilitation,,,"Money added",',
+    ].join('\n')
+    const result = parseBankFile(withCancelled, 'wise.csv')
+    expect(result.transactions).toHaveLength(1)
+    expect(result.transactions[0].raw_line).toBe('TRANSFER-2247230173')
+    expect(result.stats.skipped_rows).toBe(1)
+  })
+})
+
+describe('Wise format hardening', () => {
+  const row = (over: Partial<Record<string, string>> = {}) => {
+    const f: Record<string, string> = {
+      id: 'TRANSFER-1', status: 'COMPLETED', direction: 'IN',
+      created: '2026-06-01 10:00:00', finished: '2026-06-01 10:00:00',
+      sfeeA: '', sfeeC: '', tfeeA: '', tfeeC: '',
+      sname: 'X', samt: '100.0', scur: 'SEK', tname: 'Y', tamt: '100.0', tcur: 'SEK',
+      rate: '1', ref: '', batch: '', by: '', cat: 'General', note: '', ...over,
+    }
+    return [
+      f.id, f.status, f.direction, `"${f.created}"`, `"${f.finished}"`,
+      f.sfeeA, f.sfeeC, f.tfeeA, f.tfeeC, `"${f.sname}"`, f.samt, f.scur,
+      `"${f.tname}"`, f.tamt, f.tcur, f.rate, f.ref, f.batch, `"${f.by}"`, f.cat, f.note,
+    ].join(',')
+  }
+
+  it('fails hard on an unsupported Direction (e.g. NEUTRAL conversion)', () => {
+    const csv = [WISE_HEADER, row({ id: 'PLAN_ORDER-9', direction: 'NEUTRAL', scur: 'USD', tcur: 'SEK' })].join('\n')
+    expect(() => parseBankFile(csv, 'wise.csv')).toThrow(/unsupported Direction "NEUTRAL"/)
+  })
+
+  it('does not import a row with a blank status', () => {
+    const csv = [WISE_HEADER, row({ status: '' })].join('\n')
+    const result = parseBankFile(csv, 'wise.csv')
+    expect(result.transactions).toHaveLength(0)
+    expect(result.stats.skipped_rows).toBe(1)
+  })
+
+  it('rejects a partially numeric amount instead of coercing it', () => {
+    const csv = [WISE_HEADER, row({ samt: '12abc', tamt: '12abc' })].join('\n')
+    const result = parseBankFile(csv, 'wise.csv')
+    expect(result.transactions).toHaveLength(0)
+    expect(result.issues.some((iss) => /Invalid amount/.test(iss.message))).toBe(true)
+  })
+
+  it('skips a row with no movement currency rather than defaulting to SEK', () => {
+    const csv = [WISE_HEADER, row({ direction: 'IN', tcur: '' })].join('\n')
+    const result = parseBankFile(csv, 'wise.csv')
+    expect(result.transactions).toHaveLength(0)
+    expect(result.issues.some((iss) => /Missing\/invalid currency/.test(iss.message))).toBe(true)
+  })
+
+  it('does not inherit the movement currency for a fee with no currency', () => {
+    const csv = [WISE_HEADER, row({ sfeeA: '2.20', sfeeC: '' })].join('\n')
+    const result = parseBankFile(csv, 'wise.csv')
+    // Main row still imports; the fee is dropped with a warning, not booked in SEK.
+    expect(result.transactions).toHaveLength(1)
+    expect(result.transactions[0].raw_line).toBe('TRANSFER-1')
+    expect(result.issues.some((iss) => /no currency/.test(iss.message))).toBe(true)
   })
 })

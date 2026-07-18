@@ -4,24 +4,65 @@
 # Guidelines 9/2022 §3 (controller-side RoPA): purposes, lawful basis,
 # data subject + data category, recipients, transfer mechanism, retention,
 # security measures. Add an entry whenever a new flow ships that touches
-# personal data — onboarding, integrations, support, or regulator filings.
+# personal data: onboarding, integrations, support, or regulator filings.
 
 processing_activities:
+
+  - id: customer.private_identity
+    name: Personnummer för privatkund
+    purpose: >-
+      Identifiera en privatkund när företagets avtal, fakturering eller
+      kundadministration kräver en entydig identitet. Personnumret får endast
+      sparas på kundtypen privatkund och exponeras endast maskerat i API och UI.
+    lawful_basis: art_6_1_b
+    special_category_basis: null
+    controller: gnubok-tenant
+    processor: supabase
+    data_subjects:
+      - customer
+    data_categories:
+      - user.government_id
+    recipients:
+      - name: Supabase
+        country: EU
+        role: processor
+    international_transfers:
+      applicable: false
+      mechanism: null
+      note: EU-only processor.
+    retention:
+      duration: customer_relationship_or_7y_if_accounting_record
+      basis: contract_and_bfl_7_kap
+      stored_in:
+        - customers.personal_number
+        - retained_invoice_documents_when_required
+    security_measures:
+      - aes_256_gcm_field_encryption
+      - masked_api_and_ui_output_last4_only
+      - write_role_required
+      - rls_company_scoped
+      - no_full_value_read_endpoint
 
   - id: agi.submit
     name: AGI inlämning till Skatteverket
     purpose: >-
       Lämna in lagstadgad arbetsgivardeklaration på individnivå (AGI) till
       Skatteverket varje månad (Skatteförfarandelagen 26 kap.). Innefattar
-      huvuduppgift (HU) och individuppgifter (IU) per anställd.
+      huvuduppgift (HU) och individuppgifter (IU) per anställd. Skatteverkets
+      kvittens sparas i response_data inklusive signeradAv: personnummer för
+      den som BankID-signerade inlämningen. Ändamålet är bevis för vem som
+      juridiskt undertecknade deklarationen samt behandlingshistorik; BFL
+      5 kap. 6 § och BFNAR 2013:2 kap. 8 kräver att räkenskapsinformationen
+      bevarar den faktiska ingivaren, medan själva inlämningen styrs av SFL.
     lawful_basis: art_6_1_c   # legal obligation
     special_category_basis: null
     controller: gnubok-tenant
     processor: anthropic-na   # software supplier; Skatteverket is recipient, not processor
     data_subjects:
       - employee
+      - company_signatory           # firmatecknare/deklarationsombud (BankID-signerare av kvittensen)
     data_categories:
-      - user.government_id          # personnummer
+      - user.government_id          # personnummer (anställda i IU; signerarens i response_data.signeradAv)
       - user.name
       - user.financial.employment   # gross salary, tax withheld, benefits
       - user.financial.tax          # avgifter, sjuklönekostnad
@@ -37,10 +78,11 @@ processing_activities:
         not applicable; no third-country transfer.
     retention:
       duration: 7y
-      basis: bfl_7_kap   # BFL 7 kap. — räkenskapsinformation
+      basis: bfl_7_kap   # BFL 7 kap. 2 §: räkenskapsinformation
       stored_in:
         - agi_declarations.xml_content
         - agi_declarations.individuppgifter
+        - agi_declarations.response_data   # SKV kvittens incl. signeradAv (signerarens pnr); access via company-membership RLS
         - skatteverket_api_audit_log
     security_measures:
       - encryption_at_rest_supabase
@@ -105,7 +147,7 @@ processing_activities:
       - business_owner
     data_categories:
       - user.government_id          # orgnummer (juridiska personer) eller pnr
-      - user.financial.tax          # rutor 05–62
+      - user.financial.tax          # rutor 05-62
     recipients:
       - name: Skatteverket
         country: SE
@@ -221,7 +263,7 @@ processing_activities:
       applicable: true
       mechanism: scc_2021_c2p
       note: >-
-        Resend (US) — SCC Module 2 (controller-to-processor). Outbound
+        Resend (US): SCC Module 2 (controller-to-processor). Outbound
         payload limited to ett notifieringsmail utan finansiella belopp;
         TIA dokumenterad i .compliance/tia/resend.md.
     retention:
@@ -241,9 +283,9 @@ processing_activities:
       Föreslå bokföringskategori för banktransaktioner och tolka/extrahera
       uppladdade underlag (kvitton, leverantörsfakturor) med Anthropic
       Claude-modeller körda i Amazon Bedrock. Endast aktiv när tenanten
-      uttryckligen aktiverat AI-funktioner — kärntjänsten (bokföring, fakturor,
+      uttryckligen aktiverat AI-funktioner: kärntjänsten (bokföring, fakturor,
       moms, rapporter) fungerar fullt ut utan AI.
-    lawful_basis: art_6_1_a   # consent — opt-in, AI features off by default
+    lawful_basis: art_6_1_a   # consent: opt-in, AI features off by default
     special_category_basis: null
     controller: gnubok-tenant
     processor: aws-bedrock
@@ -261,7 +303,7 @@ processing_activities:
       applicable: false
       mechanism: null
       note: >-
-        Inferens körs i AWS-regionen eu-north-1 (Stockholm) — ingen överföring
+        Inferens körs i AWS-regionen eu-north-1 (Stockholm): ingen överföring
         till tredje land. AWS DPA + SCC + DPF-certifiering finns som
         skyddsmekanism. Prompter lagras ej hos Bedrock efter anropet och används
         ej till modellträning.
@@ -283,7 +325,7 @@ processing_activities:
     purpose: >-
       Varje MCP-verktygsanrop loggar metadata (verktygsnamn, felkod,
       felmeddelande max 500 tecken, latens, aktör, session, frivillig
-      distributionskanal-markör — t.ex. 'openclaw' via X-Gnubok-Client-header
+      distributionskanal-markör, t.ex. 'openclaw' via X-Gnubok-Client-header
       eller ?client=-parameter, sanerad mot allow-list och aldrig använd för
       auktorisation) och varje skill-laddning loggar slug/tier till event_log.
       Syftet är tillförlitlighetsanalys av agentgränssnittet: felfrekvens per

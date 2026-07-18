@@ -237,7 +237,7 @@ describe('POST /api/v1/companies/:companyId/invoices/:id/mark-paid', () => {
     expect(res.status).toBe(200)
 
     const invoiceSelects = calls.filter((c) => c.table === 'invoices' && c.method === 'select')
-    // Pre-flight select must fetch journal_entry_id — invoiceAlreadyBooked
+    // Pre-flight select must fetch journal_entry_id: invoiceAlreadyBooked
     // routing reads it; omitting it silently forces the cash path.
     expect(invoiceSelects.length).toBeGreaterThanOrEqual(2)
     expect(String(invoiceSelects[0].args[0])).toContain('journal_entry_id')
@@ -270,7 +270,7 @@ describe('POST /api/v1/companies/:companyId/invoices/:id/mark-paid', () => {
     )
 
     expect(res.status).toBe(200)
-    // Already-booked → clearing entry (Dr 1930 / Cr 1510), NOT a cash entry —
+    // Already-booked → clearing entry (Dr 1930 / Cr 1510), NOT a cash entry:
     // a cash entry here would re-recognise revenue + VAT (double-booking).
     expect(mockPayment).toHaveBeenCalled()
     expect(mockCash).not.toHaveBeenCalled()
@@ -367,6 +367,50 @@ describe('POST /api/v1/companies/:companyId/invoices/:id/mark-paid', () => {
     const body = await res.json()
     expect(body.error.code).toBe('MATCH_AMOUNT_EXCEEDS_REMAINING')
     expect(mockPayment).not.toHaveBeenCalled()
+  })
+
+  it('absorbs an öresavrundning overshoot on SEK custom lines (rounded "Att betala")', async () => {
+    // Invoice stored with öre (1234.75); the PDF shows 1235.00 and the customer
+    // pays that. The 3740 line carries the residual and the invoice settles in
+    // full instead of being rejected as an overpayment.
+    const ORE_INVOICE = {
+      ...SENT_INVOICE,
+      subtotal: 987.8,
+      vat_amount: 246.95,
+      total: 1234.75,
+      remaining_amount: 1234.75,
+    }
+    mockServiceClient.mockReturnValue(
+      makeFlexibleSupabase({
+        company_members: { data: { company_id: COMPANY_ID, role: 'owner' }, error: null },
+        invoices: [
+          { data: ORE_INVOICE, error: null },
+          { data: { ...ORE_INVOICE, status: 'paid', remaining_amount: 0, paid_amount: 1234.75 }, error: null },
+        ],
+        company_settings: { data: { accounting_method: 'accrual', entity_type: 'enskild_firma' }, error: null },
+        transactions: { data: [], error: null },
+      }),
+    )
+
+    const res = await markPaid(
+      makeRequest(
+        `https://x.test/api/v1/companies/${COMPANY_ID}/invoices/${INVOICE_ID}/mark-paid`,
+        {
+          payment_date: '2026-05-12',
+          lines: [
+            { account_number: '1930', debit_amount: 1235, credit_amount: 0 },
+            { account_number: '1510', debit_amount: 0, credit_amount: 1234.75 },
+            { account_number: '3740', debit_amount: 0, credit_amount: 0.25 },
+          ],
+        },
+      ),
+      detailParams(COMPANY_ID, INVOICE_ID),
+    )
+
+    expect(res.status).toBe(200)
+    const body = await res.json()
+    expect(body.data.status).toBe('paid')
+    expect(body.data.remaining_amount).toBe(0)
   })
 
   it('returns 400 INVOICE_PAID_NOT_PAYABLE for draft invoices', async () => {

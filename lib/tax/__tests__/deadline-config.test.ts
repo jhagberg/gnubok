@@ -11,14 +11,208 @@ function makeSettings(overrides: Partial<CompanySettingsForDeadlines> = {}): Com
     entity_type: 'aktiebolag',
     moms_period: 'quarterly',
     f_skatt: true,
+    preliminary_tax_monthly: 5000,
     vat_registered: true,
     pays_salaries: false,
+    employer_registered: null,
+    employer_seasonal: false,
     fiscal_year_start_month: 1,
+    vat_taxable_base_over_40m: false,
+    vat_has_eu_trade: false,
+    vat_filing_method: 'electronic',
+    periodisk_sammanstallning_enabled: false,
+    periodisk_sammanstallning_period: 'monthly',
+    periodisk_sammanstallning_filing_method: 'electronic',
     ...overrides,
   }
 }
 
-describe('inkomstdeklaration_ab — digital filing deadlines', () => {
+describe('VAT filing deadlines', () => {
+  it('uses the second following month for monthly filers at or below SEK 40 million', () => {
+    const dates = getConfig('moms_monthly').generateDates(2026, makeSettings({ moms_period: 'monthly' }))
+
+    expect(dates[0]).toMatchObject({ day: 12, month: 2, year: 2026, period: '2026-01' })
+    expect(dates[10]).toMatchObject({ day: 17, month: 0, year: 2027, period: '2026-11' })
+  })
+
+  it('uses the following month for monthly filers above SEK 40 million', () => {
+    const dates = getConfig('moms_monthly').generateDates(2026, makeSettings({
+      moms_period: 'monthly',
+      vat_taxable_base_over_40m: true,
+    }))
+
+    expect(dates[0]).toMatchObject({ day: 26, month: 1, year: 2026, period: '2026-01' })
+    // Raw date stays the 26th even in December; the banking-day adjustment
+    // in the generator moves annandag jul to Skatteverket's published 27th.
+    expect(dates[10]).toMatchObject({ day: 26, month: 11, year: 2026, period: '2026-11' })
+  })
+
+  it('uses May, August, November and February for quarterly VAT', () => {
+    const dates = getConfig('moms_quarterly').generateDates(2026, makeSettings())
+
+    expect(dates.map(({ day, month, year }) => ({ day, month, year }))).toEqual([
+      { day: 12, month: 4, year: 2026 },
+      { day: 17, month: 7, year: 2026 },
+      { day: 12, month: 10, year: 2026 },
+      { day: 12, month: 1, year: 2027 },
+    ])
+  })
+
+  it('uses the entity, EU-trade and filing-method rules for yearly VAT', () => {
+    const config = getConfig('moms_yearly')
+
+    expect(config.generateDates(2027, makeSettings({
+      entity_type: 'enskild_firma',
+      moms_period: 'yearly',
+    }))[0]).toMatchObject({ day: 12, month: 4, year: 2027, period: '2026' })
+    expect(config.generateDates(2027, makeSettings({
+      entity_type: 'enskild_firma',
+      moms_period: 'yearly',
+      vat_has_eu_trade: true,
+    }))[0]).toMatchObject({ day: 26, month: 1, year: 2027, period: '2026' })
+    expect(config.generateDates(2027, makeSettings({
+      moms_period: 'yearly',
+      vat_filing_method: 'paper',
+    }))[0]).toMatchObject({ day: 12, month: 6, year: 2027, period: '2026' })
+  })
+})
+
+describe('monthly tax and employer deadlines', () => {
+  it('generates preliminary tax deadlines only when an amount is debited', () => {
+    const config = getConfig('f_skatt')
+    // F-skatt approval alone carries no payment obligation.
+    expect(config.condition(makeSettings({ preliminary_tax_monthly: null }))).toBe(false)
+    expect(config.condition(makeSettings({ preliminary_tax_monthly: 0 }))).toBe(false)
+    expect(config.condition(makeSettings({ preliminary_tax_monthly: 2500 }))).toBe(true)
+    // The debited amount governs even without F-skatt approval (SA-skatt).
+    expect(config.condition(makeSettings({ f_skatt: false, preliminary_tax_monthly: 2500 }))).toBe(true)
+  })
+
+  it('uses the 12th for preliminary tax except January and August', () => {
+    const dates = getConfig('f_skatt').generateDates(2026, makeSettings())
+    expect(dates[0].day).toBe(17)
+    expect(dates[1].day).toBe(12)
+    expect(dates[7].day).toBe(17)
+  })
+
+  it('keeps the 12th in August for storföretag preliminary tax (January-only 17th)', () => {
+    const dates = getConfig('f_skatt').generateDates(2026, makeSettings({
+      moms_period: 'monthly',
+      vat_taxable_base_over_40m: true,
+    }))
+    expect(dates[0].day).toBe(17)
+    expect(dates[7].day).toBe(12)
+  })
+
+  it('gates AGI on employer registration with pays_salaries as legacy fallback', () => {
+    const config = getConfig('arbetsgivardeklaration')
+    // Never attested: fall back to pays_salaries.
+    expect(config.condition(makeSettings({ pays_salaries: true }))).toBe(true)
+    expect(config.condition(makeSettings({ pays_salaries: false }))).toBe(false)
+    // Attested registration wins over pays_salaries in both directions: a
+    // registered employer must file monthly even with zero salaries.
+    expect(config.condition(makeSettings({ employer_registered: true }))).toBe(true)
+    expect(config.condition(makeSettings({ employer_registered: false, pays_salaries: true }))).toBe(false)
+  })
+
+  it('generates only the December-period AGI row for seasonal employers', () => {
+    const dates = getConfig('arbetsgivardeklaration').generateDates(2026, makeSettings({
+      employer_registered: true,
+      employer_seasonal: true,
+    }))
+    expect(dates).toHaveLength(1)
+    // December period, declared 17 January the following year.
+    expect(dates[0]).toMatchObject({ day: 17, month: 0, year: 2027, period: '2026-12' })
+  })
+
+  it('uses the 26th for AGI when the VAT taxable base is above SEK 40 million', () => {
+    const dates = getConfig('arbetsgivardeklaration').generateDates(2026, makeSettings({
+      pays_salaries: true,
+      vat_taxable_base_over_40m: true,
+    }))
+    expect(dates.every((date) => date.day === 26)).toBe(true)
+  })
+
+  it('keeps the 12th for AGI when the employer does not report VAT', () => {
+    const dates = getConfig('arbetsgivardeklaration').generateDates(2026, makeSettings({
+      pays_salaries: true,
+      vat_registered: false,
+      vat_taxable_base_over_40m: true,
+    }))
+
+    expect(dates[1].day).toBe(12)
+    expect(dates[11].day).toBe(17) // December salaries are declared 17 January
+  })
+})
+
+describe('storföretag tax payment deadline', () => {
+  const config = getConfig('skatteinbetalning')
+
+  it('applies only to employers reporting VAT above SEK 40 million', () => {
+    expect(config.condition(makeSettings({ pays_salaries: true }))).toBe(false)
+    expect(config.condition(makeSettings({ vat_taxable_base_over_40m: true }))).toBe(false)
+    expect(config.condition(makeSettings({
+      pays_salaries: true,
+      vat_taxable_base_over_40m: true,
+      vat_registered: false,
+    }))).toBe(false)
+    expect(config.condition(makeSettings({
+      pays_salaries: true,
+      vat_taxable_base_over_40m: true,
+    }))).toBe(true)
+    // Same registration gate as AGI: attested registration wins.
+    expect(config.condition(makeSettings({
+      employer_registered: true,
+      vat_taxable_base_over_40m: true,
+    }))).toBe(true)
+    expect(config.condition(makeSettings({
+      employer_registered: false,
+      pays_salaries: true,
+      vat_taxable_base_over_40m: true,
+    }))).toBe(false)
+  })
+
+  it('is due the 12th of the following month, the 17th in January', () => {
+    const dates = config.generateDates(2026, makeSettings({
+      pays_salaries: true,
+      vat_taxable_base_over_40m: true,
+    }))
+
+    expect(dates).toHaveLength(12)
+    expect(dates[0]).toMatchObject({ day: 12, month: 1, year: 2026, period: '2026-01' })
+    expect(dates[6]).toMatchObject({ day: 12, month: 7, year: 2026, period: '2026-07' })
+    expect(dates[11]).toMatchObject({ day: 17, month: 0, year: 2027, period: '2026-12' })
+  })
+})
+
+describe('periodic EU sales list deadlines', () => {
+  const config = getConfig('periodisk_sammanstallning')
+
+  it('is only applicable when explicitly enabled', () => {
+    expect(config.condition(makeSettings())).toBe(false)
+    expect(config.condition(makeSettings({ periodisk_sammanstallning_enabled: true }))).toBe(true)
+  })
+
+  it('uses the 25th monthly for electronic filing', () => {
+    const dates = config.generateDates(2026, makeSettings({
+      periodisk_sammanstallning_enabled: true,
+    }))
+    expect(dates).toHaveLength(12)
+    expect(dates[0]).toMatchObject({ day: 25, month: 1, year: 2026, period: '2026-01' })
+  })
+
+  it('uses the 20th quarterly for paper filing', () => {
+    const dates = config.generateDates(2026, makeSettings({
+      periodisk_sammanstallning_enabled: true,
+      periodisk_sammanstallning_period: 'quarterly',
+      periodisk_sammanstallning_filing_method: 'paper',
+    }))
+    expect(dates).toHaveLength(4)
+    expect(dates[0]).toMatchObject({ day: 20, month: 3, year: 2026, period: '2026-Q1' })
+  })
+})
+
+describe('inkomstdeklaration_ab: digital filing deadlines', () => {
   const config = getConfig('inkomstdeklaration_ab')
 
   it('FY end Dec (calendar year) → Aug 1 next year', () => {
@@ -102,7 +296,39 @@ describe('inkomstdeklaration_ab — digital filing deadlines', () => {
   })
 })
 
-describe('arsredovisning — 7 months after FY end (ÅRL 8:3)', () => {
+describe('arsstamma: 6 months after FY end (ABL 7:10)', () => {
+  const config = getConfig('arsstamma')
+
+  it('applies only to aktiebolag', () => {
+    expect(config.condition(makeSettings())).toBe(true)
+    expect(config.condition(makeSettings({ entity_type: 'enskild_firma' }))).toBe(false)
+  })
+
+  it('FY end Dec (calendar year) → Jun 30 next year', () => {
+    const dates = config.generateDates(2026, makeSettings({ fiscal_year_start_month: 1 }))
+    expect(dates.length).toBe(1)
+    expect(dates[0]).toMatchObject({ day: 30, month: 5, year: 2026, period: '2025' })
+  })
+
+  it('FY end Apr → Oct 31 same year, broken-FY period label', () => {
+    const dates = config.generateDates(2026, makeSettings({ fiscal_year_start_month: 5 }))
+    expect(dates.length).toBe(1)
+    expect(dates[0]).toMatchObject({ day: 31, month: 9, year: 2026, period: '2025/2026' })
+  })
+
+  it('uses the last day of the deadline month (handles Feb)', () => {
+    // FY end Aug 2026 → +6 months = Feb 2027
+    const dates = config.generateDates(2027, makeSettings({ fiscal_year_start_month: 9 }))
+    expect(dates.length).toBe(1)
+    expect(dates[0]).toMatchObject({ day: 28, month: 1, year: 2027 })
+  })
+
+  it('no bokslut deadline type exists anymore', () => {
+    expect(TAX_DEADLINE_CONFIGS.find((c) => (c.type as string) === 'bokslut')).toBeUndefined()
+  })
+})
+
+describe('arsredovisning: 7 months after FY end (ÅRL 8:3)', () => {
   const config = getConfig('arsredovisning')
 
   it('FY end Dec (calendar year) → Jul 31 next year', () => {

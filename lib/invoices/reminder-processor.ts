@@ -4,7 +4,8 @@ import {
   generateReminderEmailHtml,
   generateReminderEmailText,
   generateReminderEmailSubject,
-  getReminderDaysConfig
+  getReminderDaysConfig,
+  type ReminderDaysConfig,
 } from '@/lib/email/reminder-templates'
 import { calculateLatePaymentInterest } from '@/lib/invoices/late-payment-interest'
 import { createReminderFeeEntry } from '@/lib/bookkeeping/reminder-fee-entries'
@@ -49,21 +50,19 @@ export interface ProcessRemindersResult {
  */
 export function determineReminderLevel(
   daysOverdue: number,
-  existingLevels: number[]
+  existingLevels: number[],
+  config: ReminderDaysConfig = getReminderDaysConfig(),
 ): 1 | 2 | 3 | null {
-  const config = getReminderDaysConfig()
-
-  // Check level 3 (45 days)
+  // Check the highest eligible level first, preserving the existing behavior
+  // when a previous cron run was missed.
   if (daysOverdue >= config[3] && !existingLevels.includes(3)) {
     return 3
   }
 
-  // Check level 2 (30 days)
   if (daysOverdue >= config[2] && !existingLevels.includes(2)) {
     return 2
   }
 
-  // Check level 1 (15 days)
   if (daysOverdue >= config[1] && !existingLevels.includes(1)) {
     return 1
   }
@@ -146,21 +145,21 @@ export async function sendReminder(
 export async function processOverdueReminders(): Promise<ProcessRemindersResult> {
   const supabase = createServiceClient()
   const results: ReminderResult[] = []
-  const config = getReminderDaysConfig()
 
-  // Find all sent invoices that are past due date (at least 15 days overdue)
-  const minOverdueDays = config[1]
+  // Company schedules can start as early as one day overdue. Fetch that
+  // bounded candidate set, then apply each company's thresholds below.
   const cutoffDate = new Date()
-  cutoffDate.setDate(cutoffDate.getDate() - minOverdueDays)
+  cutoffDate.setDate(cutoffDate.getDate() - 1)
 
-  // Positive allowlist — inherently excludes 'paid', 'partially_paid', 'cancelled', 'credited'.
+  // Positive allowlist: inherently excludes 'paid', 'partially_paid', 'cancelled', 'credited'.
   // Including 'overdue' ensures level-2 / level-3 reminders re-fire after the first reminder
   // flips status to 'overdue' (see status update below).
   const { data: overdueInvoices, error: invoiceError } = await supabase
     .from('invoices')
     .select(`
       *,
-      customer:customers(*)
+      customer:customers(*),
+      credit_notes:invoices!credited_invoice_id(id, status, creation_complete)
     `)
     .in('status', ['sent', 'overdue'])
     .is('credited_invoice_id', null)
@@ -181,6 +180,17 @@ export async function processOverdueReminders(): Promise<ProcessRemindersResult>
 
   // Process each invoice
   for (const invoice of overdueInvoices) {
+    const activeCreditNotes = ((invoice as { credit_notes?: Array<{
+      status: string
+      creation_complete?: boolean
+    }> }).credit_notes ?? []).filter(
+      (creditNote) => creditNote.status !== 'cancelled' && creditNote.creation_complete !== false,
+    )
+    if (activeCreditNotes.length > 0) {
+      log.info(`Skipping invoice ${invoice.invoice_number}: active credit note exists`)
+      continue
+    }
+
     const customer = invoice.customer as Customer
 
     // Skip if customer has no email
@@ -195,7 +205,7 @@ export async function processOverdueReminders(): Promise<ProcessRemindersResult>
       .select('reminder_level, response_type')
       .eq('invoice_id', invoice.id)
 
-    // Skip if customer already responded (marked paid OR disputed) — they've
+    // Skip if customer already responded (marked paid OR disputed): they've
     // told us they don't want another reminder. The business owner still needs
     // to record the actual payment (mark-paid / match-invoice) to flip status
     // and post the journal entry; we don't do that here because the customer
@@ -209,13 +219,6 @@ export async function processOverdueReminders(): Promise<ProcessRemindersResult>
 
     const existingLevels = existingReminders?.map(r => r.reminder_level) || []
     const daysOverdue = calculateDaysOverdue(invoice.due_date)
-    const reminderLevel = determineReminderLevel(daysOverdue, existingLevels)
-
-    // Skip if no reminder needed
-    if (!reminderLevel) {
-      log.info(`Skipping invoice ${invoice.invoice_number}: no reminder needed (${daysOverdue} days overdue, existing levels: ${existingLevels.join(', ')})`)
-      continue
-    }
 
     // Get company settings for this user
     const { data: company, error: companyError } = await supabase
@@ -226,14 +229,17 @@ export async function processOverdueReminders(): Promise<ProcessRemindersResult>
 
     if (companyError || !company) {
       log.error(`Skipping invoice ${invoice.invoice_number}: company settings not found`)
-      results.push({
-        invoiceId: invoice.id,
-        invoiceNumber: invoice.invoice_number,
-        customerEmail: customer.email,
-        reminderLevel,
-        success: false,
-        error: 'Company settings not found'
-      })
+      const fallbackLevel = determineReminderLevel(daysOverdue, existingLevels)
+      if (fallbackLevel) {
+        results.push({
+          invoiceId: invoice.id,
+          invoiceNumber: invoice.invoice_number,
+          customerEmail: customer.email,
+          reminderLevel: fallbackLevel,
+          success: false,
+          error: 'Company settings not found',
+        })
+      }
       continue
     }
 
@@ -243,16 +249,35 @@ export async function processOverdueReminders(): Promise<ProcessRemindersResult>
       continue
     }
 
-    // Race-window guard — re-check invoice status immediately before sending.
+    const reminderConfig = getReminderDaysConfig(company as CompanySettings)
+    const reminderLevel = determineReminderLevel(daysOverdue, existingLevels, reminderConfig)
+
+    if (!reminderLevel) {
+      log.info(`Skipping invoice ${invoice.invoice_number}: no reminder needed (${daysOverdue} days overdue, existing levels: ${existingLevels.join(', ')})`)
+      continue
+    }
+
+    // Race-window guard: re-check invoice status immediately before sending.
     // The cron runs at 08:00; a payment match arriving during the run shouldn't
     // produce a reminder for an already-paid invoice.
     const { data: currentInvoice } = await supabase
       .from('invoices')
-      .select('status')
+      .select('status, credit_notes:invoices!credited_invoice_id(id, status, creation_complete)')
       .eq('id', invoice.id)
+      .eq('company_id', invoice.company_id)
       .single()
 
-    if (!currentInvoice || !['sent', 'overdue'].includes(currentInvoice.status as string)) {
+    const currentCreditNotes = ((currentInvoice as { credit_notes?: Array<{
+      status: string
+      creation_complete?: boolean
+    }> } | null)?.credit_notes ?? []).filter(
+      (creditNote) => creditNote.status !== 'cancelled' && creditNote.creation_complete !== false,
+    )
+    if (
+      !currentInvoice ||
+      !['sent', 'overdue'].includes(currentInvoice.status as string) ||
+      currentCreditNotes.length > 0
+    ) {
       log.info(`Skipping invoice ${invoice.invoice_number}: status changed to ${currentInvoice?.status ?? 'unknown'} mid-run`)
       continue
     }
@@ -268,7 +293,7 @@ export async function processOverdueReminders(): Promise<ProcessRemindersResult>
     })
 
     // Determine the lagstadgad påminnelseavgift (Lag 1981:739, max 60 kr).
-    // Clamp at 60 kr — the statute caps the fee even if company_settings
+    // Clamp at 60 kr: the statute caps the fee even if company_settings
     // somehow holds a higher value (defense in depth against a stale DB row).
     const reminderFee = company.reminder_fee_enabled
       ? Math.min(60, Math.round((company.reminder_fee_amount ?? 60) * 100) / 100)
@@ -277,7 +302,7 @@ export async function processOverdueReminders(): Promise<ProcessRemindersResult>
     // Book the fee as a journal entry. Booked BEFORE creating the
     // invoice_reminders row so we can persist fee_journal_entry_id.
     // Failure to book the fee is logged but does not abort the reminder
-    // send — the customer still needs to receive the notification.
+    // send: the customer still needs to receive the notification.
     let feeJournalEntryId: string | null = null
     if (reminderFee > 0) {
       try {
@@ -295,7 +320,7 @@ export async function processOverdueReminders(): Promise<ProcessRemindersResult>
           `Failed to book reminder fee for invoice ${invoice.invoice_number}:`,
           feeError as Error,
         )
-        // Continue — surcharge still appears in the email, but no JE is linked.
+        // Continue: surcharge still appears in the email, but no JE is linked.
       }
     }
 

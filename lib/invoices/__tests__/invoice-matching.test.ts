@@ -146,7 +146,7 @@ describe('calculateMatchScore', () => {
 })
 
 // ============================================================
-// findMatchingInvoices (integration — mock Supabase)
+// findMatchingInvoices (integration: mock Supabase)
 // ============================================================
 
 describe('findMatchingInvoices', () => {
@@ -184,12 +184,31 @@ describe('findMatchingInvoices', () => {
     expect(result[0].matchReason).toContain('OCR-referens')
   })
 
+  it('never suggests a credit note, even when its OCR reference matches', async () => {
+    const tx = makeTransaction({ amount: 12500, reference: 'KR-F-2024001' })
+    mockResult({
+      data: [
+        makeInvoice({
+          invoice_number: 'KR-F-2024001',
+          status: 'sent',
+          total: -12500,
+          credited_invoice_id: 'original-invoice-1',
+        }),
+      ],
+      error: null,
+    })
+
+    const result = await findMatchingInvoices(supabase as never, 'company-1', tx)
+
+    expect(result).toEqual([])
+  })
+
   it('returns immediately on OCR match without further scoring', async () => {
     const tx = makeTransaction({ amount: 12500, reference: 'F-2024001' })
     mockResult({
       data: [
         { ...makeInvoice({ invoice_number: 'F-2024001', total: 12500, status: 'sent', remaining_amount: 12500, currency: 'SEK' }) },
-        // Second invoice with exact amount — should not be scored
+        // Second invoice with exact amount: should not be scored
         {
           ...makeInvoice({ id: 'inv-2', invoice_number: 'F-2024002', total: 12500, status: 'sent', remaining_amount: 12500, currency: 'SEK' }),
           customer: makeCustomer({ name: 'Test match description' }),
@@ -361,7 +380,7 @@ describe('getBestInvoiceMatch', () => {
 })
 
 // ============================================================
-// findMatchingInvoices — paid-voucher status-leak guard
+// findMatchingInvoices: paid-voucher status-leak guard
 // ============================================================
 //
 // Defensive filter added because manual verifikationer (booked outside the
@@ -374,7 +393,7 @@ describe('getBestInvoiceMatch', () => {
 //     more payments legitimately)
 //   - invoices without payment rows still pass through unchanged
 
-describe('findMatchingInvoices — status-leak guard', () => {
+describe('findMatchingInvoices: status-leak guard', () => {
   it('excludes a sent invoice that already has a payment voucher', async () => {
     const { supabase: queuedSupabase, enqueue } = createQueuedMockSupabase()
     const inv = {

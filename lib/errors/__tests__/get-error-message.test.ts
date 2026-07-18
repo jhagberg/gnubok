@@ -1,7 +1,13 @@
 import { describe, it, expect } from 'vitest'
 import { getErrorMessage } from '../get-error-message'
+import {
+  AccountsNotInChartError,
+  BookkeepingDatabaseError,
+  CannotReverseStornoError,
+  JournalEntryNotBalancedError,
+} from '@/lib/bookkeeping/errors'
 
-describe('getErrorMessage — typed bookkeeping error codes', () => {
+describe('getErrorMessage: typed bookkeeping error codes', () => {
   it('ACCOUNTS_NOT_IN_CHART → lists accounts to activate', () => {
     const msg = getErrorMessage({
       error: { code: 'ACCOUNTS_NOT_IN_CHART', message: '...', account_numbers: ['1930', '2641'] },
@@ -83,7 +89,7 @@ describe('getErrorMessage — typed bookkeeping error codes', () => {
   })
 
   it('BOOKKEEPING_DATABASE_ERROR falls through to regex pattern for period lock', () => {
-    // Period-lock trigger errors come through as DB errors — message should still
+    // Period-lock trigger errors come through as DB errors: message should still
     // match the locked-period pattern and produce the specific Swedish message.
     const msg = getErrorMessage({
       error: {
@@ -95,7 +101,58 @@ describe('getErrorMessage — typed bookkeeping error codes', () => {
   })
 })
 
-describe('getErrorMessage — English locale uses registry English (C9)', () => {
+describe('getErrorMessage: typed bookkeeping Error instances (issue #337)', () => {
+  it('JournalEntryNotBalancedError instance → rich Swedish amount message', () => {
+    const msg = getErrorMessage(new JournalEntryNotBalancedError(100, 80), { context: 'transaction' })
+    expect(msg).toContain('balanserar inte')
+    expect(msg).toMatch(/100/)
+    expect(msg).toMatch(/80/)
+    expect(msg).not.toContain('Journal entry is not balanced')
+  })
+
+  it('BookkeepingDatabaseError instance → Swedish, never the raw constraint string', () => {
+    const msg = getErrorMessage(
+      new BookkeepingDatabaseError(
+        'commit_entry',
+        'new row for relation "journal_entries" violates check constraint "check_balanced"',
+      ),
+      { context: 'transaction' },
+    )
+    expect(msg).toBe('Verifikationen kunde inte sparas. Försök igen.')
+    expect(msg).not.toContain('check constraint')
+    expect(msg).not.toContain('Database operation')
+  })
+
+  it('BookkeepingDatabaseError instance wrapping a period-lock trigger → specific Swedish message', () => {
+    const msg = getErrorMessage(
+      new BookkeepingDatabaseError('commit_entry', 'Cannot create entry in locked/closed fiscal period'),
+    )
+    expect(msg).toBe('Perioden är låst. Verifikationen kan inte skapas i en stängd eller låst period.')
+  })
+
+  it('AccountsNotInChartError instance → Swedish account-activation message', () => {
+    const msg = getErrorMessage(new AccountsNotInChartError(['1930']))
+    expect(msg).toBe('Följande konton behöver aktiveras: 1930')
+  })
+
+  it('CannotReverseStornoError instance → registry Swedish message (no dynamic branch)', () => {
+    const msg = getErrorMessage(new CannotReverseStornoError('reversal'))
+    expect(msg).toBe('En stornering eller rättelse kan inte stornas.')
+    expect(msg).not.toContain('Cannot reverse')
+  })
+
+  it('locale "en" on a typed instance → registry English message', () => {
+    const msg = getErrorMessage(new CannotReverseStornoError('reversal'), { locale: 'en' })
+    expect(msg).toBe('A storno or correction entry cannot be reversed.')
+  })
+
+  it('regression: plain-object bare envelope with a Swedish message passes through unchanged', () => {
+    const msg = getErrorMessage({ code: 'SOME_CODE', message: 'Kunde inte hantera fakturan. Försök igen.' })
+    expect(msg).toBe('Kunde inte hantera fakturan. Försök igen.')
+  })
+})
+
+describe('getErrorMessage: English locale uses registry English (C9)', () => {
   it('returns the registry English message for a known structured code instead of Swedish', () => {
     const code = 'FISCAL_PERIOD_NOT_FOUND'
     const sv = getErrorMessage({ error: { code, message: '...' } })
@@ -114,11 +171,11 @@ describe('getErrorMessage — English locale uses registry English (C9)', () => 
   })
 })
 
-describe('getErrorMessage — accumulated validation details', () => {
+describe('getErrorMessage: accumulated validation details', () => {
   it('surfaces the specific per-item reasons instead of the generic 400 message', () => {
     const msg = getErrorMessage(
       {
-        error: 'Valideringsfel — korrigera innan godkännande',
+        error: 'Valideringsfel: korrigera innan godkännande',
         details: ['Tomas Tysén: Bankuppgifter saknas (clearingnummer och/eller kontonummer)'],
         warnings: [],
       },
@@ -147,7 +204,39 @@ describe('getErrorMessage — accumulated validation details', () => {
   })
 })
 
-describe('getErrorMessage — existing patterns still work', () => {
+describe('getErrorMessage: payment-file route messages surface (issue #945)', () => {
+  // These specific { error: '...' } strings previously collapsed to the generic
+  // HTTP-400 message because isSwedishUserMessage did not recognize "krävs" /
+  // "saknar", so the user learned nothing about why the betalfil failed.
+  it('surfaces a "saknar bankkontouppgifter" message instead of the generic 400', () => {
+    const msg = getErrorMessage(
+      { error: '2 anställd(a) saknar bankkontouppgifter' },
+      { context: 'salary', statusCode: 400 },
+    )
+    expect(msg).toBe('2 anställd(a) saknar bankkontouppgifter')
+    expect(msg).not.toBe('Förfrågan innehåller ogiltiga uppgifter.')
+  })
+
+  it('surfaces a "... krävs ..." message instead of the generic 400', () => {
+    const msg = getErrorMessage(
+      { error: 'Momsregistreringsnummer krävs när företaget är momsregistrerat (ML 11 kap. 8§)' },
+      { context: 'settings', statusCode: 400 },
+    )
+    expect(msg).toContain('krävs')
+    expect(msg).not.toBe('Förfrågan innehåller ogiltiga uppgifter.')
+  })
+
+  it('surfaces the missing company bank-account message', () => {
+    const msg = getErrorMessage(
+      { error: 'Företagets bankkonto (clearingnummer och kontonummer) saknas i företagsinställningar. Fyll i det under Inställningar → Fakturering för att skapa betalfil.' },
+      { context: 'salary', statusCode: 400 },
+    )
+    expect(msg).toContain('Företagets bankkonto')
+    expect(msg).not.toBe('Förfrågan innehåller ogiltiga uppgifter.')
+  })
+})
+
+describe('getErrorMessage: existing patterns still work', () => {
   it('regex match for "Entry date ... outside fiscal period" on plain string', () => {
     const msg = getErrorMessage('Entry date 2024-06-15 is outside fiscal period "FY 2025"')
     expect(msg).toBe('Datumet ligger utanför det valda räkenskapsåret.')

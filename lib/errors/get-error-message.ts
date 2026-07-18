@@ -13,11 +13,13 @@
  * output. UI callers should pass the active locale from useLocale() / getLocale().
  *
  * Specific domain phrases (locked period, unbalanced voucher, etc.) remain
- * Swedish for now — those refer to statutory accounting concepts and English
+ * Swedish for now: those refer to statutory accounting concepts and English
  * users will still see them on Skatteverket-bound surfaces.
  */
 
 import { formatCurrency } from '@/lib/utils'
+// Pure module (no next/server): safe for the client bundles this file lives in.
+import { formatDimensionValidationIssues } from '@/lib/bookkeeping/dimension-errors'
 import { getErrorEntry } from './structured-errors'
 
 type ErrorContext =
@@ -122,11 +124,11 @@ const ERROR_PATTERN_MAP: [RegExp, string | null][] = [
   ],
   [
     /Cannot delete voucher in a closed fiscal period/i,
-    'Verifikationen kan inte raderas — räkenskapsåret är stängt.',
+    'Verifikationen kan inte raderas: räkenskapsåret är stängt.',
   ],
   [
     /Cannot delete voucher in a locked fiscal period/i,
-    'Verifikationen kan inte raderas — perioden är låst.',
+    'Verifikationen kan inte raderas: perioden är låst.',
   ],
   [
     /Cannot delete: other entries reference this voucher/i,
@@ -164,6 +166,8 @@ function isSwedishUserMessage(message: string): boolean {
     /försök igen/i,
     /ogiltigt?/i,
     /saknas/i,
+    /saknar/i,
+    /krävs/i,
     /måste/i,
     /redan finns/i,
     /gick fel/i,
@@ -269,6 +273,28 @@ export function getErrorMessage(
     // of the whole `result`. Pick the English variant when the UI locale is
     // English; otherwise fall back to the Swedish `message`.
     if (typeof obj.code === 'string' && typeof obj.message === 'string' && obj.message.trim()) {
+      // Typed domain exceptions (lib/bookkeeping/errors.ts classes) also match
+      // this shape, but their `message` is raw English (often a DB constraint
+      // string) and must never reach the user verbatim. Normalize the instance
+      // into the structured envelope so the per-code branches below own the
+      // translation. Class fields are enumerable own props, so { ...obj }
+      // carries exactly the details those branches expect (totalDebit,
+      // lockDate, reason, issues, ...), while the non-enumerable Error.message
+      // stays out of details. Plain objects (forwarded inner envelopes,
+      // PostgrestError-shaped literals) keep the passthrough behavior.
+      if (error instanceof Error) {
+        return getErrorMessage(
+          {
+            error: {
+              code: obj.code,
+              message: obj.message,
+              account_numbers: (obj as { accountNumbers?: unknown }).accountNumbers,
+              details: { ...obj },
+            },
+          },
+          options
+        )
+      }
       if (locale === 'en' && typeof obj.message_en === 'string' && obj.message_en.trim()) {
         return obj.message_en
       }
@@ -287,7 +313,7 @@ export function getErrorMessage(
 
       // For English UI, return the registry's English message for any known
       // code instead of falling through to the Swedish branches below (which
-      // ignored locale — English users were shown Swedish prose). The Swedish
+      // ignored locale: English users were shown Swedish prose). The Swedish
       // path is left entirely unchanged; codes absent from the registry still
       // fall through. The dynamic branches (amounts / lock date / reason) keep
       // owning Swedish display.
@@ -341,6 +367,20 @@ export function getErrorMessage(
         return 'Kontering saknas för transaktionen. Kontrollera bokföringsreglerna.'
       }
 
+      if (structured.code === 'DIMENSION_VALIDATION_FAILED') {
+        // Prefer reconstructing the per-code Swedish sentences from the
+        // machine-readable issue list (present on both the dashboard and the
+        // v1/registry error envelopes); fall back to the message, which the
+        // engine already emits in Swedish naming the offending codes.
+        const details = structured.details as { issues?: unknown } | undefined
+        const formatted = formatDimensionValidationIssues(details?.issues)
+        if (formatted) return formatted
+        if (typeof structured.message === 'string' && structured.message.trim()) {
+          return structured.message
+        }
+        return 'Ett angivet kostnadsställe/projekt finns inte i dimensionsregistret eller är arkiverat. Skapa värdet i registret först.'
+      }
+
       if (structured.code === 'NO_OPEN_PERIOD_FOR_DATE') {
         return 'Det finns ingen räkenskapsperiod som täcker det valda datumet. Skapa eller öppna räkenskapsåret först.'
       }
@@ -356,13 +396,20 @@ export function getErrorMessage(
           : 'Räkenskapsperioden för det valda datumet är låst. Lås upp perioden för att flytta verifikationen dit.'
       }
 
+      if (structured.code === 'OB_COMPANY_LOCK_DATE') {
+        const details = structured.details as { lockDate?: string } | undefined
+        return details?.lockDate
+          ? `Bokföringen är låst t.o.m. ${details.lockDate} och ingående balanser kan inte korrigeras. Ta bort eller flytta låsdatumet under Inställningar → Bokföring och försök igen.`
+          : 'Bokföringen är låst av företagets låsdatum och ingående balanser kan inte korrigeras. Ta bort eller flytta låsdatumet under Inställningar → Bokföring och försök igen.'
+      }
+
       if (structured.code === 'MEANINGLESS_CORRECTION') {
         const details = structured.details as { reason?: string } | undefined
         if (details?.reason === 'no_date_change') {
-          return 'Det nya datumet är samma som det nuvarande — det finns inget att flytta.'
+          return 'Det nya datumet är samma som det nuvarande: det finns inget att flytta.'
         }
         if (details?.reason === 'identical_to_original') {
-          return 'Rättelsen är identisk med originalverifikationen — inget har ändrats.'
+          return 'Rättelsen är identisk med originalverifikationen: inget har ändrats.'
         }
         return 'Rättelsen saknar ekonomisk innebörd: varje konto netto till noll. En rättelse måste beskriva en faktisk affärshändelse (BFL 5 kap. 5 §).'
       }
@@ -382,6 +429,13 @@ export function getErrorMessage(
         return structured.message_en
       }
       if (typeof structured.message === 'string' && structured.message.trim()) {
+        // Known codes without a dynamic branch above (e.g. CANNOT_REVERSE_STORNO)
+        // carry raw English engine messages: prefer the registry's Swedish
+        // message so no typed code surfaces English in a Swedish UI.
+        if (locale === 'sv' && typeof structured.code === 'string' && !isSwedishUserMessage(structured.message)) {
+          const entry = getErrorEntry(structured.code)
+          if (entry?.message_sv) return entry.message_sv
+        }
         return structured.message
       }
     }
@@ -389,7 +443,7 @@ export function getErrorMessage(
     // Accumulated per-item validation list from routes that collect several
     // problems before responding, e.g. the salary approve route:
     //   { error: 'Valideringsfel …', details: ['Tomas Tysén: Bankuppgifter saknas …', …] }
-    // Surface the specific reasons — otherwise this shape falls all the way
+    // Surface the specific reasons: otherwise this shape falls all the way
     // through to the generic HTTP-400 message and the user learns nothing.
     if (
       Array.isArray(obj.details) &&
